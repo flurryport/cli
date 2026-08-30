@@ -1,0 +1,41 @@
+{
+  "name": "flurryport",
+  "version": "0.6.3",
+  "description": "FlurryPORT CLI - forward webhook captures to your local machine",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "flurryport": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "npm run build && node --test tests/mcp-pacing.test.mjs tests/write-plane-libs.test.mjs tests/post-intent-and-search.test.mjs tests/credential-router.test.mjs tests/pilot1-hardening.test.mjs tests/seat-server.test.mjs tests/console.test.mjs tests/console-comfort.test.mjs tests/record-control.test.mjs tests/lifecycle.test.mjs tests/description-casing.test.mjs tests/mint-seat.test.mjs tests/set-orientation.test.mjs tests/hosted-rooms.test.mjs tests/room-canon.test.mjs tests/collection-edits.test.mjs tests/slice3-validation.test.mjs tests/slice4-mcp-surface.test.mjs tests/slice6-request-seat.test.mjs tests/recipe-version-pins.test.mjs tests/device-login.test.mjs tests/standing-attach.test.mjs",
+    "test:nvim": "node nvim/tests/run.mjs",
+    "prepublishOnly": "npm run build && node --test tests/mcp-pacing.test.mjs tests/write-plane-libs.test.mjs tests/post-intent-and-search.test.mjs tests/credential-router.test.mjs tests/pilot1-hardening.test.mjs tests/seat-server.test.mjs tests/console.test.mjs tests/console-comfort.test.mjs tests/record-control.test.mjs tests/lifecycle.test.mjs tests/description-casing.test.mjs tests/mint-seat.test.mjs tests/set-orientation.test.mjs tests/hosted-rooms.test.mjs tests/room-canon.test.mjs tests/collection-edits.test.mjs tests/slice3-validation.test.mjs tests/slice4-mcp-surface.test.mjs tests/slice6-request-seat.test.mjs tests/recipe-version-pins.test.mjs tests/device-login.test.mjs tests/standing-attach.test.mjs",
+    "build:mcpb": "npm run build && node scripts/build-mcpb.mjs"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts"
+  ],
+  "keywords": [
+    "webhook",
+    "capture",
+    "replay",
+    "cli",
+    "flurryport"
+  ],
+  "homepage": "https://flurryport.io",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "typescript": "~5.6.2"
+  }
+}
