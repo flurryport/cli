@@ -11,7 +11,7 @@ import { registerCatalogTools } from '../lib/mcp-catalog-tools.js';
 import { registerInviteTools } from '../lib/mcp-invite-tools.js';
 import { AuthApiError, createAuthApiClient, resolveAuthBaseUrl, type AuthApiClient } from '../lib/auth-api.js';
 import { makeRoutingClient, type ScopedCredential } from '../lib/credential-router.js';
-import { announceClaim, announceWriteDecision, registerAuthTools, type AuthToolContext } from '../lib/mcp-auth-tools.js';
+import { announceClaim, announceWriteDecision, createAuthSessionState, registerAuthTools, type AuthToolContext } from '../lib/mcp-auth-tools.js';
 import { collectTools, registerUnifiedTools } from '../lib/mcp-unified.js';
 import { DeviceFlowController } from '../lib/device-flow.js';
 import { WriteUpgradeController } from '../lib/write-upgrade.js';
@@ -31,7 +31,7 @@ import { serveMcpHttp } from '../lib/mcp-http.js';
  * message goes to stderr.
  */
 export const mcpCommand = new Command('mcp')
-  .description('Run the FlurryPORT MCP server (stdio, or streamable HTTP with --http) for AI editors — capture and inspect webhooks with no signup')
+  .description('Run the FlurryPORT MCP server (stdio, or streamable HTTP with --http) for AI editors - capture and inspect webhooks with no signup')
   .option('--allow-lan', 'permit forward_to_localhost to target private LAN addresses (RFC1918), not just loopback', false)
   .option('--anon-url <url>', 'override the anonymous capture base URL (default https://flurryport.dev or FLURRYPORT_ANON_URL)')
   .option(
@@ -52,8 +52,14 @@ export const mcpCommand = new Command('mcp')
   .option('--port <port>', 'HTTP port (with --http)', '8790')
   .option(
     '--host <host>',
-    'HTTP bind address (with --http). Loopback by default so nothing is exposed without an explicit choice; front a tunnel for remote clients',
+    'HTTP bind address (with --http). Loopback by default so nothing is exposed without an explicit choice; front a tunnel for remote clients ' +
+    'and pass the tunnel hostname via --allowed-hosts (or FLURRYPORT_MCP_ALLOWED_HOSTS)',
     '127.0.0.1',
+  )
+  .option(
+    '--allowed-hosts <hosts>',
+    'comma-separated public hostnames accepted in the Host header (with --http): the tunnel or reverse-proxy host in front of this server. ' +
+    'Loopback names always pass; FLURRYPORT_MCP_ALLOWED_HOSTS also adds to this list',
   )
   .action(async (opts: McpCommandOptions) => {
     const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +70,7 @@ export const mcpCommand = new Command('mcp')
       const handle = await serveMcpHttp({
         host: opts.host,
         port: Number.parseInt(opts.port, 10),
+        allowedHosts: opts.allowedHosts?.split(','),
         build: () => buildMcpServer(opts, pkg.version),
       });
       await handle.closed;
@@ -83,6 +90,7 @@ interface McpCommandOptions {
   http: boolean;
   port: string;
   host: string;
+  allowedHosts?: string;
 }
 
 /**
@@ -130,6 +138,7 @@ async function buildMcpServer(
       const ctx: AuthToolContext = {
         client: makeRoutingClient(() => inner.value, scoped),
         allowLan: opts.allowLan,
+        session: createAuthSessionState(),
         joinedGrants: () => scoped.map((c) => ({ projectId: c.projectId, endpointId: c.endpointId, accountName: c.accountName })),
       };
       if (scoped.length > 0) {
@@ -190,7 +199,7 @@ async function buildMcpServer(
       return {
         server,
         banner:
-          `flurryport mcp ${version} — authenticated mode against ${inner.value.baseUrl}` +
+          `flurryport mcp ${version} - authenticated mode against ${inner.value.baseUrl}` +
           (opts.allowLan ? ' (LAN forwarding enabled)' : ''),
       };
     }
@@ -215,6 +224,7 @@ async function buildMcpServer(
     const authCtx: AuthToolContext = {
       client: makeRoutingClient(() => anonInner.value, anonScoped),
       allowLan: opts.allowLan,
+      session: createAuthSessionState(),
       joinedGrants: () => anonScoped.map((c) => ({ projectId: c.projectId, endpointId: c.endpointId, accountName: c.accountName })),
     };
     wireWriteUpgrade(authCtx, anonInner);
@@ -230,7 +240,7 @@ async function buildMcpServer(
       // Migration breadcrumb (0.2.3): orient the agent to the claimed data so it
       // skips the post-flip project/endpoint rediscovery entirely.
       if (release.MigratedProjectId && release.MigratedEndpointId) {
-        announceClaim({
+        announceClaim(authCtx.session, {
           projectId: guidToBase62(release.MigratedProjectId),
           endpointId: guidToBase62(release.MigratedEndpointId),
           endpointSlug: release.MigratedEndpointSlug ?? '',
@@ -287,7 +297,7 @@ async function buildMcpServer(
     return {
       server,
       banner:
-        `flurryport mcp ${version} — anonymous mode against ${client.baseUrl}` +
+        `flurryport mcp ${version} - anonymous mode against ${client.baseUrl}` +
         (opts.allowLan ? ' (LAN forwarding enabled)' : ''),
     };
 }
@@ -323,12 +333,12 @@ function wireWriteUpgrade(ctx: AuthToolContext, inner: { value: AuthApiClient })
       // Swap the DEFAULT credential in its holder; the routing facade (ctx.client)
       // stays stable, so every tool handler upgrades in place.
       inner.value = createAuthApiClient(inner.value.baseUrl, token);
-      announceWriteDecision(true);
-      console.error(chalk.green('Write access granted — switched to the read-write token in place.'));
+      announceWriteDecision(ctx.session, true);
+      console.error(chalk.green('Write access granted - switched to the read-write token in place.'));
     },
     async () => {
-      announceWriteDecision(false);
-      console.error(chalk.dim('Write access skipped by the user — staying read-only.'));
+      announceWriteDecision(ctx.session, false);
+      console.error(chalk.dim('Write access skipped by the user - staying read-only.'));
     },
   );
   ctx.armWriteUpgrade = () => controller.ensureStarted();
@@ -350,7 +360,9 @@ function resolveInviteBaseUrl(fallback: string): string {
  * disk rebuilds the router with zero human action.
  */
 function loadScopedCredentials(apiUrl: string, bootToken: string): ScopedCredential[] {
-  try {
+  // Round 3: no catch - a locked config silently dropping every joined grant is
+  // the same identity downgrade as detectPat's; the boot path handles the throw.
+  {
     const config = loadConfig();
     const env = config.environments[config.activeEnvironment];
     if (!env) return [];
@@ -362,8 +374,6 @@ function loadScopedCredentials(apiUrl: string, bootToken: string): ScopedCredent
         accountName: name,
         client: createAuthApiClient(apiUrl, acc.apiKey),
       }));
-  } catch {
-    return [];
   }
 }
 
@@ -429,19 +439,16 @@ function detectPat(accountName?: string): { token: string; apiUrl: string } | nu
   // accounts. A miss is a loud exit: a boot pinned to 'guest' that silently fell back to the
   // operator's account would recreate exactly the stored_only fallthrough this ladder fixes.
   if (accountName) {
-    try {
-      const config = loadConfig();
-      const env = config.environments[config.activeEnvironment];
-      const apiKey = env?.accounts[accountName]?.apiKey;
-      if (apiKey) return { token: apiKey, apiUrl: resolveAuthBaseUrl(env.apiUrl) };
-    } catch {
-      /* fall through to the loud exit */
-    }
+    // Round 3: loadConfig throws ONLY on a locked/unreadable config now - swallowing
+    // that produced the WRONG loud exit ('account not stored') or, below, a silent
+    // anonymous boot with a stored PAT present. Let it propagate: the top-level
+    // handler prints it cleanly, and an HTTP per-session build answers 500.
+    const config = loadConfig();
+    const env = config.environments[config.activeEnvironment];
+    const apiKey = env?.accounts[accountName]?.apiKey;
+    if (apiKey) return { token: apiKey, apiUrl: resolveAuthBaseUrl(env.apiUrl) };
     // #170: only mention "environment" when the user has a non-default config.
-    let plainWording = true;
-    try {
-      plainWording = isDefaultProdOnly(loadConfig());
-    } catch { /* keep the plain wording */ }
+    const plainWording = isDefaultProdOnly(config);
     console.error(chalk.red(
       (plainWording
         ? `Account '${accountName}' is not stored. `
@@ -454,14 +461,12 @@ function detectPat(accountName?: string): { token: string; apiUrl: string } | nu
   if (envToken && envToken.startsWith('fp_')) {
     return { token: envToken, apiUrl: resolveAuthBaseUrl() };
   }
-  try {
-    const config = loadConfig();
-    const env = config.environments[config.activeEnvironment];
-    const accountName = env?.activeAccount;
-    const apiKey = accountName ? env.accounts[accountName]?.apiKey : undefined;
-    if (apiKey) return { token: apiKey, apiUrl: resolveAuthBaseUrl(env.apiUrl) };
-    return null;
-  } catch {
-    return null;
-  }
+  // Round 3: no catch - a locked config must fail the boot loudly, never boot
+  // this server ANONYMOUS while a stored PAT exists (silent identity downgrade).
+  const config = loadConfig();
+  const env = config.environments[config.activeEnvironment];
+  const active = env?.activeAccount;
+  const apiKey = active ? env.accounts[active]?.apiKey : undefined;
+  if (apiKey) return { token: apiKey, apiUrl: resolveAuthBaseUrl(env.apiUrl) };
+  return null;
 }

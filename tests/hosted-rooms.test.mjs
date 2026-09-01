@@ -19,7 +19,7 @@ process.env.HOME = process.env.USERPROFILE;
 
 const { resolveRoomsUrl, resolveRoomsIdleMinutes, resolvePublicApiHost, ROOMS_MCP_PATH } = await import('../dist/lib/rooms.js');
 const { collectTools } = await import('../dist/lib/mcp-unified.js');
-const { registerAuthTools } = await import('../dist/lib/mcp-auth-tools.js');
+const { registerAuthTools, createAuthSessionState } = await import('../dist/lib/mcp-auth-tools.js');
 const { serveMcpHttp } = await import('../dist/lib/mcp-http.js');
 const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
 
@@ -113,7 +113,7 @@ function fakeClient(baseUrl) {
 }
 
 async function mintPass(baseUrl, args) {
-  const tools = collectTools((s) => registerAuthTools(s, { client: fakeClient(baseUrl), allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client: fakeClient(baseUrl), allowLan: false }));
   const result = await tools.get('mint_seat').handler({ projectId: 'P1', endpointId: 'E1', guestName: 'coder', chairAddress: 'gene', ...args });
   assert.ok(!result.isError, result.content[0].text);
   return JSON.parse(result.content[0].text).passText;
@@ -123,7 +123,7 @@ test('mint_seat default: the pass names {api base}/rooms/mcp and its /rooms/whoa
   delete process.env.FLURRYPORT_ROOMS_URL;
   const pass = await mintPass(PROD_API, {});
   assert.match(pass, /- Seat server: https:\/\/api\.flurryport\.io\/rooms\/mcp \(MCP over streamable HTTP\)\./);
-  assert.match(pass, /- Before redeeming, GET https:\/\/api\.flurryport\.io\/rooms\/whoami;/);
+  assert.match(pass, /- Optional check before redeeming: GET https:\/\/api\.flurryport\.io\/rooms\/whoami answers/);
   assert.doesNotMatch(pass, /127\.0\.0\.1/, 'no loopback address rides a default pass');
   assert.doesNotMatch(pass, /the host runs flurryport seat-server/);
 });
@@ -133,7 +133,7 @@ test('mint_seat env override: FLURRYPORT_ROOMS_URL replaces the derived address'
   try {
     const pass = await mintPass(PROD_API, {});
     assert.match(pass, /- Seat server: https:\/\/rooms\.example\.test\/mcp /);
-    assert.match(pass, /GET https:\/\/rooms\.example\.test\/whoami;/);
+    assert.match(pass, /GET https:\/\/rooms\.example\.test\/whoami answers/);
   } finally {
     delete process.env.FLURRYPORT_ROOMS_URL;
   }
@@ -151,7 +151,7 @@ test('mint_seat explicit seatServerUrl: a self-hosted room wins over env and def
 });
 
 test('mint_seat description teaches the hosted default and reserves seatServerUrl for self-hosting', () => {
-  const tools = collectTools((s) => registerAuthTools(s, { client: fakeClient(PROD_API), allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client: fakeClient(PROD_API), allowLan: false }));
   const tool = tools.get('mint_seat');
   assert.match(tool.def.description, /hosted room address by default/);
   assert.match(tool.def.description, /seatServerUrl ONLY for a self-hosted room/);

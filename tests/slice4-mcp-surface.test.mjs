@@ -20,7 +20,7 @@ process.env.FLURRYPORT_WEB_URL = 'https://flurryport.io';
 
 const { collectTools } = await import('../dist/lib/mcp-unified.js');
 const { registerSeatTools, ROOM_VERB_ALIASES } = await import('../dist/lib/mcp-seat-tools.js');
-const { registerAuthTools } = await import('../dist/lib/mcp-auth-tools.js');
+const { registerAuthTools, createAuthSessionState } = await import('../dist/lib/mcp-auth-tools.js');
 const { registerCatalogTools } = await import('../dist/lib/mcp-catalog-tools.js');
 const { registerInviteTools } = await import('../dist/lib/mcp-invite-tools.js');
 const { registerServerInfoTool } = await import('../dist/lib/mcp-server-info.js');
@@ -203,7 +203,7 @@ function limitClient({ failPath, failCode }) {
 
 test('add_to_collection at the item cap hands back the exact collection to open (#353)', async () => {
   const client = limitClient({ failPath: '/captures', failCode: 'collection_item_limit_exceeded' });
-  const tools = collectTools((s) => registerAuthTools(s, { client, allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client, allowLan: false }));
   const out = await tools.get('add_to_collection').handler({
     projectId: 'P1', endpointId: 'E1', collectionId: 'COL1', captureIds: ['3zo8KCJura7azy3g6YRQGY'],
   });
@@ -217,7 +217,7 @@ test('add_to_collection at the item cap hands back the exact collection to open 
 
 test('remove_from_collection points at the collection the workspace still owns (#353)', async () => {
   const client = limitClient({});
-  const tools = collectTools((s) => registerAuthTools(s, { client, allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client, allowLan: false }));
   const out = await tools.get('remove_from_collection').handler({
     projectId: 'P1', endpointId: 'E1', collectionId: 'COL1', captureId: '3zo8KCJura7azy3g6YRQGY',
   });
@@ -229,7 +229,7 @@ test('remove_from_collection points at the collection the workspace still owns (
 });
 
 test('get_upgrade_options says buying is a human move and where (#353)', async () => {
-  const tools = collectTools((s) => registerAuthTools(s, { client: limitClient({}), allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client: limitClient({}), allowLan: false }));
   const out = await tools.get('get_upgrade_options').handler({});
   const payload = JSON.parse(out.content[0].text);
   // The billing catalog is unreachable from a test, so the tool may answer either way;
@@ -256,7 +256,7 @@ test('request_secret_setup hands the human the endpoint their secrets belong to 
     },
     async post() { return { MissingSecrets: ['SLACK_BOT_TOKEN'], MaskedEmail: 'g***@spill.coffee', ExpiresAt: '2026-08-22T13:00:00Z' }; },
   };
-  const tools = collectTools((s) => registerAuthTools(s, { client, allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client, allowLan: false }));
 
   const sent = JSON.parse((await tools.get('request_secret_setup').handler({ projectId: 'P1', endpointId: 'E1' })).content[0].text);
   assert.match(sent.humanAction.label, /g\*\*\*@spill\.coffee/, 'the label names the inbox');
@@ -288,7 +288,12 @@ const BUDGET = {
   // Raised again 2026-08-26 evening because the INVENTORY gained a verb: #409's
   // chair gate put authorize_standing on the owner surface (the 60th tool) and the
   // standing flag on mint_seat's contract.
-  ownerToolsListChars: 75_800,
+  // Raised 2026-08-31 for ruled contract text, after trimming: the pass-copy
+  // sitting put senderName on mint_seat's contract (the preamble's one fill slot)
+  // and made revoke_invite's description tell the truth about redeemed seats
+  // (it always unseated them; the old text denied it and sent humans to the web
+  // UI). Both texts are at their lean form.
+  ownerToolsListChars: 76_300,
   // Raised 2026-08-26 for ruled contract text, after trimming: the rooms bash put
   // forSections (#411), checkOnly + the oversize warning (#405), the body
   // string-or-object union (#405), and the deduped roster (#409) on the seat
@@ -303,7 +308,11 @@ const BUDGET = {
   // Lowered 2026-08-26 by the #403 slim (6.7KB -> ~5.2KB): the wire-schema and
   // status detail moved to the published /recipes/wire page. Drift back up past
   // this line means doctrine is creeping back into the block.
-  seatInstructionsChars: 5_500,
+  // Raised 2026-08-31 for a ruled rule, compressed to three lines first: the
+  // pass-copy sitting's speak-plainly law (room words are wire vocabulary; a
+  // human never needs them to answer their own agent) is taught in the block so
+  // translation does not depend on which model holds the seat.
+  seatInstructionsChars: 5_800,
 };
 
 test('the tools/list a client fetches on connect stays inside its budget (#350)', () => {
@@ -395,7 +404,7 @@ test('record_recipe_install sends the record and reads back the roster (#354)', 
     },
     async post() { return {}; },
   };
-  const tools = collectTools((s) => registerAuthTools(s, { client, allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client, allowLan: false }));
   const out = await tools.get('record_recipe_install').handler({
     projectId: 'P1', endpointId: 'E1',
     ref: 'flurryport:slack-post', version: 3, contentHash: 'sha256:abc', state: 'ready',
@@ -425,6 +434,6 @@ test('the measurement harness builds the same inventory the server registers (#3
   registerCatalogTools(sink);
   registerServerInfoTool(sink, { version: '0.6.0', mode: { authenticated: true }, getBaseUrl: () => client.baseUrl });
   registerInviteTools(sink, { resolveBaseUrl: () => client.baseUrl, onJoined: async () => 'routed', onSwitchToGuest: async () => false });
-  for (const [name, entry] of collectTools((s) => registerAuthTools(s, { client, allowLan: false }))) collected.set(name, entry);
+  for (const [name, entry] of collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client, allowLan: false }))) collected.set(name, entry);
   assert.deepEqual([...ownerTools().keys()].sort(), [...collected.keys()].sort());
 });

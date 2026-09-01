@@ -7,10 +7,16 @@ import type { MetaNotice } from './mcp-meta.js';
  * Version-staleness nudge (ratified 2026-08-03). The CLI stamps its own package version
  * on every Core API request; when the server's LATEST_CLI_VERSION says this CLI is
  * stale, it answers with a ready-to-relay notice header. The API clients latch the
- * header here and the meta builders surface it as `meta.notice` on EVERY tool response
- * (no dedupe - the experiment is whether agents act on it unprompted, so it must stay
- * visible, not fire once and vanish). The server owns both the verdict and the message
- * text; this module adds no coaching of its own.
+ * header here and the meta builders surface it as `meta.notice`.
+ *
+ * DEDUPE (2026-08-31 incident): the original design repeated the identical advisory on
+ * every response as an experiment in whether agents act on it unprompted. The incident
+ * closed the experiment with a negative result: seven identical banners rode seven
+ * successful calls and trained the agent to read past all of them, right up to minting
+ * a cross-incompatible artifact. A given message now surfaces ONCE per process; a
+ * CHANGED message (the server escalating, a new version landing mid-session) surfaces
+ * again. The server owns both the verdict and the message text; this module adds no
+ * coaching of its own.
  */
 
 /** Request header carrying this CLI's package version. */
@@ -77,12 +83,33 @@ function isSelfNag(message: string): boolean {
   return versions.every((v) => compareVersions(v, ownVersion) <= 0);
 }
 
+/** Messages already relayed this process - see the DEDUPE note above. */
+const surfacedNotices = new Set<string>();
+
 /**
  * The meta builders' lowest-precedence notice: fills the slot whenever no one-time
- * notice (milestone, claim, write-grant) claimed it, so a stale CLI sees it on
- * effectively every call.
+ * notice (milestone, claim, write-grant) claimed it. Each distinct message surfaces
+ * once per process (advisory severity); a changed message surfaces anew.
  */
 export function takeCliUpdateNotice(): MetaNotice | null {
   if (!latchedNotice || isSelfNag(latchedNotice)) return null;
-  return { code: 'cli_update_available', message: latchedNotice };
+  if (surfacedNotices.has(latchedNotice)) return null;
+  surfacedNotices.add(latchedNotice);
+  return { code: 'cli_update_available', message: latchedNotice, severity: 'advisory' };
+}
+
+/**
+ * Dedupe-free read for surfaces whose JOB is the staleness verdict (get_server_info):
+ * an already-relayed advisory must still answer "is an update available?" truthfully.
+ * Never marks the message surfaced - a peek is not a relay.
+ */
+export function peekCliUpdateNotice(): MetaNotice | null {
+  if (!latchedNotice || isSelfNag(latchedNotice)) return null;
+  return { code: 'cli_update_available', message: latchedNotice, severity: 'advisory' };
+}
+
+/** Test seam: forget what has been surfaced (a fresh process's state). */
+export function resetCliNoticeDedupeForTest(): void {
+  surfacedNotices.clear();
+  latchedNotice = null;
 }

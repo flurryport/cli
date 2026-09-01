@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { readJsonStore, writeJsonStore } from './store.js';
 
 /**
  * Console-local presentation state (the VIEW verb class, ratified): per-seat color
@@ -61,21 +61,15 @@ interface ConsoleViewFile {
 const VIEW_STATE_FILE = () => join(homedir(), '.flurryport', 'console.json');
 
 function load(): ConsoleViewFile {
-  try {
-    if (existsSync(VIEW_STATE_FILE())) {
-      const parsed = JSON.parse(readFileSync(VIEW_STATE_FILE(), 'utf8')) as ConsoleViewFile;
-      if (parsed && parsed.seats) return parsed;
-    }
-  } catch {
-    /* corrupt view state reads as empty; the next save rewrites it */
-  }
+  // Corrupt OR unreadable view state reads as empty (presentation-only state -
+  // a locked file must not crash a render; the next save rewrites it).
+  const parsed = readJsonStore<ConsoleViewFile>(VIEW_STATE_FILE(), { lenient: true });
+  if (parsed && parsed.seats) return parsed;
   return { version: 1, seats: {} };
 }
 
 function save(file: ConsoleViewFile): void {
-  const dir = join(homedir(), '.flurryport');
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(VIEW_STATE_FILE(), JSON.stringify(file, null, 2), 'utf-8');
+  writeJsonStore(VIEW_STATE_FILE(), file);
 }
 
 export function getSeatView(endpointId: string, handle: string): SeatViewState {
@@ -107,11 +101,6 @@ export function putSeatDeleted(endpointId: string, inviteId: string): void {
   const file = load();
   file.deleted = { ...file.deleted, [`${endpointId}:${inviteId}`]: true };
   save(file);
-}
-
-/** Deterministic default color: roster position cycles the palette. */
-export function defaultColor(rosterIndex: number): ConsoleColor {
-  return CONSOLE_COLORS[rosterIndex % CONSOLE_COLORS.length];
 }
 
 /** The seeded chair address, or null on a virgin config (the ask has not happened yet). */

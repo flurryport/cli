@@ -1,5 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { recordCliNotice, takeCliUpdateNotice } from './version-nudge.js';
+import { peekCliUpdateNotice, recordCliNotice } from './version-nudge.js';
 
 /**
  * get_server_info (#106 identity half, Codex round-2 preamble finding): agents asked
@@ -61,7 +61,9 @@ export function registerServerInfoTool(server: McpServer, source: ServerInfoSour
       // The server owns the staleness verdict (X-FlurryPort-Cli-Notice, latched from
       // Core responses). Present = a newer version exists and the notice text says so;
       // null = current as far as the server has said, or no Core call has answered yet.
-      const notice = takeCliUpdateNotice();
+      // Peek, never take: this surface's JOB is the verdict, so the meta builders'
+      // once-per-process dedupe must not blank it.
+      const notice = peekCliUpdateNotice();
 
       const payload = {
         name: 'FlurryPORT',

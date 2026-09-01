@@ -20,7 +20,7 @@ configCommand
 
     const accountNames = Object.keys(env.accounts);
     if (accountNames.length === 0) {
-      console.log(chalk.dim(`Accounts:    (none — add one with "flurryport login <token>")`));
+      console.log(chalk.dim(`Accounts:    (none - add one with "flurryport login <token>")`));
       return;
     }
 
@@ -77,7 +77,7 @@ configCommand
       const accountCount = Object.keys(env.accounts).length;
       const accounts = accountCount === 0 ? chalk.dim('no accounts') : chalk.dim(`${accountCount} account${accountCount === 1 ? '' : 's'}`);
       const isProd = env.apiUrl === PROD_API_URL ? chalk.dim(' [prod]') : '';
-      console.log(`${active} ${chalk.bold(name)} — ${env.apiUrl} (${accounts})${isProd}`);
+      console.log(`${active} ${chalk.bold(name)} - ${env.apiUrl} (${accounts})${isProd}`);
     }
   });
 

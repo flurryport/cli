@@ -23,7 +23,7 @@ process.env.HOME = process.env.USERPROFILE;
 
 const { parseCaptureReceipt } = await import('../dist/lib/intent-post.js');
 const { registerSeatTools } = await import('../dist/lib/mcp-seat-tools.js');
-const { registerAuthTools } = await import('../dist/lib/mcp-auth-tools.js');
+const { registerAuthTools, createAuthSessionState } = await import('../dist/lib/mcp-auth-tools.js');
 const { collectTools } = await import('../dist/lib/mcp-unified.js');
 const { seatServerInstructions } = await import('../dist/lib/mcp-server-instructions.js');
 const { consoleMessages, verbHelp } = await import('../dist/lib/console-messages.js');
@@ -144,7 +144,7 @@ test('post_intent: a re-linked proposal receipt carries postDiff; an ordinary po
 });
 
 test('post_intent describes the routing refusal and the diff on both surfaces (#360)', () => {
-  const owner = collectTools((s) => registerAuthTools(s, { client: { baseUrl: 'http://127.0.0.1:9', get: async () => ({}) }, quota: 'none' }));
+  const owner = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client: { baseUrl: 'http://127.0.0.1:9', get: async () => ({}) }, quota: 'none' }));
   const ownerDesc = String(owner.get('post_intent').def.description);
   assert.match(ownerDesc, /postDiff \{section, linesAdded, linesRemoved, linesChanged, unchanged, oversize\}/);
   // #374: the refusal is about naming a section with `for`; `to` is never gated.
@@ -205,7 +205,7 @@ test('the status vocabulary keeps finding, with the detail on the wire page (#36
 });
 
 test('the verbs new in 0.6.0 say so, so stale notes self-correct (#364e)', () => {
-  const owner = collectTools((s) => registerAuthTools(s, { client: { baseUrl: 'http://127.0.0.1:9', get: async () => ({}) }, quota: 'none' }));
+  const owner = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client: { baseUrl: 'http://127.0.0.1:9', get: async () => ({}) }, quota: 'none' }));
   for (const name of ['get_canon', 'list_sections', 'remove_from_collection', 'replace_collection_item']) {
     const desc = String(owner.get(name).def.description);
     assert.match(desc, /New in 0\.6\.0: notes that do not mention it are stale\./, name);

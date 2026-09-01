@@ -229,6 +229,12 @@ export const seatServerInstructions = (version: string): string => [
     'count. On arrival, read the room history once, then ride your joinedAtCursor for everything new, ' +
     'and keep polling; do not wait to be prompted. Give content posts a one-line summary member so ' +
     'readers triage without the full text; aiTags is reserved for content retrieval, never narration.',
+  // Pass-copy sitting ruling (Gene, 2026-08-31): ceremony vocabulary is for the
+  // wire; a human should never need it to answer their own agent. Taught here so
+  // the translation does not depend on which model happens to hold the seat.
+  'Speaking to your human: room words (gavel, pin, ratify, adjourn, canon) are wire vocabulary, ' +
+    'never theirs. Relay decisions and asks in plain language ("Want me to record this? Yes or no ' +
+    'is enough"); your human should never need this room\'s vocabulary to answer you.',
   // #403: governance-neutral. The platform defines the verbs; the ROOM defines who
   // presides and how decisions resolve. Chairless rooms were getting chair doctrine.
   'Governance is the room\'s, never this block\'s: the ORIENTATION declares who presides, how ' +

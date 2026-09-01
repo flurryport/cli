@@ -18,16 +18,22 @@ import { resolvePublicApiHost, resolveRoomsIdleMinutes, resolveRoomsStandingIdle
  */
 export const seatServerCommand = new Command('seat-server')
   .description(
-    'Run the FlurryPORT seat server (streamable HTTP): a hosted-agent MCP surface with room verbs only — ' +
+    'Run the FlurryPORT seat server (streamable HTTP): a hosted-agent MCP surface with room verbs only - ' +
     'each session redeems a seat pairing code and posts/reads as that seat',
   )
   .option(
     '--host <host>',
     'HTTP bind address. Loopback by default so nothing is exposed without an explicit choice; front ' +
-    'a TLS tunnel or reverse proxy for remote clients',
+    'a TLS tunnel or reverse proxy for remote clients and pass its public hostname via --allowed-hosts ' +
+    '(or FLURRYPORT_MCP_ALLOWED_HOSTS)',
     '127.0.0.1',
   )
   .option('--port <port>', 'HTTP port', '8791')
+  .option(
+    '--allowed-hosts <hosts>',
+    'comma-separated public hostnames accepted in the Host header: the tunnel or reverse-proxy host ' +
+    'in front of this server. Loopback names always pass; FLURRYPORT_MCP_ALLOWED_HOSTS also adds to this list',
+  )
   .option(
     '--api-url <url>',
     'FlurryPORT API base URL (FLURRYPORT_API_URL still wins; default https://api.flurryport.io)',
@@ -37,7 +43,7 @@ export const seatServerCommand = new Command('seat-server')
     'Close a session that has sent nothing for this long (FLURRYPORT_ROOMS_IDLE_MINUTES still wins; ' +
     'default 30). A redeemed seat also closes when the seat itself ends',
   )
-  .action(async (opts: { host: string; port: string; apiUrl?: string; idleMinutes?: string }) => {
+  .action(async (opts: { host: string; port: string; apiUrl?: string; idleMinutes?: string; allowedHosts?: string }) => {
     const __dirname = dirname(fileURLToPath(import.meta.url));
     const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8')) as { version: string };
     const apiBase = resolveAuthBaseUrl(opts.apiUrl);
@@ -66,6 +72,7 @@ export const seatServerCommand = new Command('seat-server')
     const handle = await serveMcpHttp({
       host: opts.host,
       port: Number.parseInt(opts.port, 10),
+      allowedHosts: opts.allowedHosts?.split(','),
       drainNotice: consoleMessages.chairLeft,
       idleMs: idleMinutes * 60_000,
       build: async () => buildSeatServer({ apiBase, version: pkg.version, publicHost, standingIdleMinutes }),

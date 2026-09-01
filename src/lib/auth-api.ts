@@ -1,5 +1,5 @@
 import { guidToBase62 } from './base62.js';
-import { appendFieldErrors } from './anon-api.js';
+import { parseErrorResponse } from './fetch-error.js';
 import { recordCliNotice, versionHeader } from './version-nudge.js';
 
 /**
@@ -115,26 +115,7 @@ export function createAuthApiClient(
     // Latch the server's version-staleness notice (if any) for the meta builders.
     if (trackNotices) recordCliNotice(res);
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      let code =
-        res.status === 401 ? 'unauthorized'
-        : res.status === 403 ? 'forbidden'
-        : res.status === 404 ? 'not_found'
-        : res.status === 429 ? 'throttled'
-        : 'error';
-      let detail = text;
-      try {
-        const raw = JSON.parse(text) as Record<string, unknown>;
-        detail = (raw.detail as string) ?? (raw.Error as string) ?? (raw.title as string) ?? text;
-        detail = appendFieldErrors(detail, raw.errors);
-        // TypedApplicationResult problems carry the machine error code in "type"/"title"
-        // (e.g. binding_limit_exceeded) — surface it so tools can key recovery hints
-        // off the code instead of matching message prose. Mirrors anon-api's parse.
-        if (typeof raw.type === 'string' && !raw.type.startsWith('http')) code = raw.type;
-        else if (typeof raw.title === 'string' && /^[a-z_]+$/.test(raw.title)) code = raw.title;
-      } catch {
-        /* not JSON */
-      }
+      const { code, detail } = await parseErrorResponse(res);
       throw new AuthApiError(res.status, code, detail);
     }
     return res.json() as Promise<Record<string, unknown>>;

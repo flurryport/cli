@@ -46,7 +46,8 @@ export function validateLocalUrl(rawUrl: string, allowLan: boolean): LocalUrlVer
   };
 }
 
-function isLoopbackHost(host: string): boolean {
+/** THE loopback definition, shared with the mcp-http transport guard (one 'this machine'). */
+export function isLoopbackHost(host: string): boolean {
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (host === '::1' || host === '[::1]') return true;
   // 127.0.0.0/8

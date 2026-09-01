@@ -62,7 +62,9 @@ export function makeRoutingClient(
     get baseUrl() {
       return getDefault().baseUrl;
     },
-    get: (path) => pick(path).get(path),
+    // opts carries the AbortSignal (#253 long-poll drain) - dropping it here left
+    // hung fetches on session switch/shutdown (cleanup C9).
+    get: (path, opts) => pick(path).get(path, opts),
     post: (path, body) => pick(path).post(path, body),
     put: (path, body) => pick(path).put(path, body),
     delete: (path) => pick(path).delete(path),

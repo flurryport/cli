@@ -16,7 +16,7 @@ process.env.USERPROFILE = mkdtempSync(join(tmpdir(), 'fp-mint-seat-home-'));
 process.env.HOME = process.env.USERPROFILE;
 
 const { collectTools } = await import('../dist/lib/mcp-unified.js');
-const { registerAuthTools } = await import('../dist/lib/mcp-auth-tools.js');
+const { registerAuthTools, createAuthSessionState } = await import('../dist/lib/mcp-auth-tools.js');
 const { putChairIdentity } = await import('../dist/lib/console-view-state.js');
 
 const CODE = '7WHM-KR4P-XT2B';
@@ -50,7 +50,7 @@ const mintRelease = {
 
 function mintTool(routes) {
   const client = fakeClient(routes);
-  const tools = collectTools((s) => registerAuthTools(s, { client, allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client, allowLan: false }));
   return { client, handler: tools.get('mint_seat').handler };
 }
 
@@ -157,7 +157,7 @@ test('mint_seat room slug is best-effort: a failed slug lookup degrades to the g
   const result = await handler({ projectId: 'P1', endpointId: 'E1', guestName: 'coder', chairAddress: 'gene' });
   assert.ok(!result.isError, result.content[0].text);
   const payload = JSON.parse(result.content[0].text);
-  assert.match(payload.passText, /^You have a seat at a FlurryPORT room\.\n/);
+  assert.match(payload.passText, /\nYou have a seat at a FlurryPORT room\.\n/);
   assert.equal(payload.pairingCode, CODE);
 });
 
@@ -174,10 +174,30 @@ test('mint_seat #351: codeMinutes rides the wire as CodeMinutes; omitted sends n
 });
 
 test('mint_seat #351: the tool description states the default and the option', async () => {
-  const tools = collectTools((s) => registerAuthTools(s, { client: fakeClient(), allowLan: false }));
+  const tools = collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client: fakeClient(), allowLan: false }));
   const description = String(tools.get('mint_seat').def.description);
   assert.match(description, /10 minutes/);
   assert.match(description, /codeMinutes/);
+});
+
+test('mint_seat pass preamble (pass-copy sitting 2026-08-31): senderName fills the slot, neutral fallback otherwise; bootstrap and failure lines ride every pass', async () => {
+  const named = JSON.parse((await mintTool(roomRoutes()).handler({
+    projectId: 'P1', endpointId: 'E1', guestName: 'coder', chairAddress: 'gene', senderName: 'Gene',
+  })).content[0].text);
+  assert.match(named.passText, /^Gene saved a place for your AI assistant in a shared chat where assistants work together\./);
+  assert.match(named.passText, /You don't need to sign up, install anything, or open anything in a browser/);
+  assert.match(named.passText, /Paste the whole message into a chat with your AI assistant, such as Claude or ChatGPT/);
+
+  const plain = JSON.parse((await mintTool(roomRoutes()).handler({
+    projectId: 'P1', endpointId: 'E1', guestName: 'coder', chairAddress: 'gene',
+  })).content[0].text);
+  assert.match(plain.passText, /^The person who sent you this saved a place for your AI assistant/);
+
+  // The agent body's newcomer lines: how to GET the redeem tool, the optional
+  // preflight's exit, and the no-improvise failure path.
+  assert.match(plain.passText, /add that address as an MCP server first/);
+  assert.match(plain.passText, /Skip this check if you cannot fetch URLs\./);
+  assert.match(plain.passText, /tell your human exactly what failed and stop; never retry blindly or improvise/);
 });
 
 test('mint_seat #412: every pass carries the stay-or-go rule, standing by default', async () => {

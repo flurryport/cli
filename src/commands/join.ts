@@ -5,6 +5,7 @@ import { loadConfig, saveConfig, getEnvironment, isDefaultProdOnly, participantA
 import { classifyCeremonyState, createInviteJoinClient, type CeremonyState } from '../lib/invite-api.js';
 import { AnonApiError } from '../lib/anon-api.js';
 import { friendlyFetchError } from '../lib/fetch-error.js';
+import { sanitizeWireLine } from '../lib/sanitize.js';
 import { contributorKeyRef, putCredential } from '../lib/keystore.js';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -193,16 +194,33 @@ export const joinCommand = new Command('join')
         ? `\nAccepted. Access token stored as account "${accountName}".`
         : `\nAccepted. Access token stored as account "${accountName}" in environment "${envName}".`));
       if (res.ParticipantName) {
-        console.log(chalk.dim(`  You are "${res.ParticipantName}" on this stream: the same name labels your posts and watches.`));
+        // An adversarial room owner names the participant: strip terminal escapes
+        // before printing during the join ceremony, when the user is primed to
+        // trust what the CLI says (precedent #5).
+        console.log(chalk.dim(`  You are "${sanitizeWireLine(res.ParticipantName)}" on this stream: the same name labels your posts and watches.`));
       }
 
       if (res.SigningKey && res.ContributorEndpointId) {
         // Producer grant: keep the signing key in the keystore, keyed by endpoint.
-        putCredential(contributorKeyRef(res.ContributorEndpointId), {
-          type: 'contributor',
-          value: res.SigningKey,
-          createdAt: new Date().toISOString(),
-        });
+        // Round 3: the release is ONE-SHOT and the invite is already consumed - a
+        // keystore lock here must not crash the ceremony with a raw stack and lose
+        // the key silently. The store already retried; a persistent failure gets
+        // the honest consequence and the recovery named.
+        try {
+          putCredential(contributorKeyRef(res.ContributorEndpointId), {
+            type: 'contributor',
+            value: res.SigningKey,
+            createdAt: new Date().toISOString(),
+          });
+        } catch (persistErr) {
+          console.error(chalk.red(
+            `The producer signing key could not be stored (${(persistErr as Error).message}).`));
+          console.error(chalk.red(
+            'The invite is already consumed and the key cannot be re-collected: your account works as a ' +
+            'MONITOR (reads), but signed posting needs a fresh invite - ask the host to revoke this seat ' +
+            'and mint a new one once ~/.flurryport is writable.'));
+          return;
+        }
         console.log(chalk.green('You joined as a producer. A signing key was saved for this endpoint.'));
         console.log(chalk.dim('  Send signed events without touching crypto: `flurryport post` signs with this key'));
         console.log(chalk.dim('  automatically, as does the MCP post_intent tool (npx -y flurryport mcp).'));

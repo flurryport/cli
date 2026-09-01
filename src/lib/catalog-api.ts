@@ -10,6 +10,8 @@
  * core catch-all - B3.0b carve-out).
  */
 
+import { parseErrorResponse } from './fetch-error.js';
+
 export interface CatalogRecipeItem {
   Ref: string;
   PublisherSlug: string;
@@ -60,6 +62,8 @@ export class CatalogApiError extends Error {
      * published; the latest is 5") from the generic transport line.
      */
     public readonly detail: string | null = null,
+    /** Machine error code from the shared ProblemDetails parse (review finding 10). */
+    public readonly code: string = 'error',
   ) {
     super(message);
   }
@@ -105,24 +109,15 @@ async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!res.ok) {
     // #355: a bad pin answers ProblemDetails whose detail NAMES the latest published
-    // version. Relaying "404 Not Found from <url>" instead threw that answer away and
-    // left the agent guessing which version exists; keep the server's sentence.
-    const detail = await problemDetail(res);
-    throw new CatalogApiError(res.status, detail ?? `${res.status} ${res.statusText} from ${url}`, detail);
+    // version. The SHARED parse (review finding 10 - this was the sixth hand-rolled
+    // copy) keeps that sentence, the machine code, and any field errors. Only a
+    // JSON body counts as the server's sentence (round 3): an ingress 502's raw
+    // HTML page must fall back to the clean status line, not become the message.
+    const { code, detail, isJson } = await parseErrorResponse(res);
+    const sentence = isJson && detail.trim() ? detail : null;
+    throw new CatalogApiError(res.status, sentence ?? `${res.status} ${res.statusText} from ${url}`, sentence, code);
   }
   return (await res.json()) as T;
-}
-
-/** The `detail` (or `title`) of a ProblemDetails body, when the answer carries one. */
-async function problemDetail(res: Response): Promise<string | null> {
-  try {
-    const raw = JSON.parse(await res.text()) as { detail?: unknown; title?: unknown };
-    const detail = typeof raw.detail === 'string' && raw.detail.trim() ? raw.detail : null;
-    const title = typeof raw.title === 'string' && raw.title.trim() ? raw.title : null;
-    return detail ?? title;
-  } catch {
-    return null;
-  }
 }
 
 /** Full published listing, cached briefly - the catalog is small and the tool may be

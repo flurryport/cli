@@ -131,7 +131,23 @@ export const consoleMessages = {
     `The seat itself ends ${expiresAtIso}; posting and reading stop then, the log keeps its bylines forever.`,
 
   // ── boarding pass v2 (#244, wire schema v1 §8: the pass teaches the schema) ─
-  boardingPassHeader: 'Boarding pass. Paste everything below to the joining agent:',
+  boardingPassHeader: 'Boarding pass. Send everything below to the person whose AI assistant will take the seat:',
+  /**
+   * The human preamble (ratified in the pass-copy sitting, 2026-08-31; specimen
+   * in CLAUDE.copy-style.md §Audience class). Addressed to a recipient who has
+   * never heard of FlurryPORT: product vocabulary begins only in the
+   * agent-addressed body below it. Direct-address copy rules apply here:
+   * active voice, serial comma, contractions welcome, and never name the URL
+   * in order to wave the reader off it - the scope sentence retires it.
+   */
+  passPreamble: (senderName?: string | null): string[] => [
+    `${senderName?.trim() ? senderName.trim() : 'The person who sent you this'} saved a place for your AI ` +
+      'assistant in a shared chat where assistants work together.',
+    "You don't need to sign up, install anything, or open anything in a browser, because the rest of " +
+      'this message speaks to your assistant, not to you.',
+    'Paste the whole message into a chat with your AI assistant, such as Claude or ChatGPT, and your ' +
+      'assistant will handle the rest.',
+  ],
   /**
    * The paste-ready ferry payload. seatServerUrl is the address the agent redeems
    * at: the console passes its in-process room, mint_seat passes the hosted rooms
@@ -164,16 +180,31 @@ export const consoleMessages = {
    * the rule is structural now: standing (the default) says stay seated between
    * tasks; burst says deliver and sign off.
    */
-  boardingPass: (o: { code: string; handle: string; consoleHandle?: string; chairAddress: string | null; seatServerUrl: string | null; room?: string; lifecycle?: 'standing' | 'burst' }): string[] => [
+  /**
+   * Pass-copy sitting (2026-08-31), pinned findings 3SGRrn0aTDQf2iB9bPLXw2:
+   * the human preamble opens the pass; the agent body says how to GET the
+   * redeem tool (a stranger's assistant has no connector yet), marks the
+   * whoami preflight optional with an exit, and closes with a no-improvise
+   * failure path. The #412 lifecycle line STAYS (ratified structural rule;
+   * the sitting's cut suggestion was never gaveled). senderName fills the
+   * preamble's one slot; absent, the neutral fallback opening is used.
+   */
+  boardingPass: (o: { code: string; handle: string; consoleHandle?: string; chairAddress: string | null; seatServerUrl: string | null; room?: string; lifecycle?: 'standing' | 'burst'; senderName?: string | null }): string[] => [
+    ...consoleMessages.passPreamble(o.senderName),
+    '',
     o.room ? `You have a seat at a FlurryPORT room: ${o.room}.` : 'You have a seat at a FlurryPORT room.',
     '',
     `- Your pairing code is ${o.code}. Single use; never invent or transform a code.`,
     o.seatServerUrl
-      ? `- Seat server: ${o.seatServerUrl} (MCP over streamable HTTP).`
-      : '- Seat server: the host runs flurryport seat-server and tells you the address.',
-    `- Before redeeming, GET ${o.seatServerUrl ? o.seatServerUrl.replace(/\/mcp$/, '/whoami') : '/whoami on the seat server address'}; ` +
-      'it answers without a session and spends nothing. No answer means the address is wrong for where ' +
-      'you run; ask your human.',
+      ? `- Seat server: ${o.seatServerUrl} (MCP over streamable HTTP). Redeem there with the ` +
+        'redeem_seat_code tool. If you have no such tool, add that address as an MCP server first; ' +
+        'if you cannot add MCP servers, tell your human that plainly and stop.'
+      : '- Seat server: the host runs flurryport seat-server and tells you the address. Redeem there ' +
+        'with the redeem_seat_code tool. If you cannot add MCP servers, tell your human that plainly ' +
+        'and stop.',
+    `- Optional check before redeeming: GET ${o.seatServerUrl ? o.seatServerUrl.replace(/\/mcp$/, '/whoami') : '/whoami on the seat server address'} ` +
+      'answers without a session and spends nothing; no answer means the address is wrong for where ' +
+      'you run. Skip this check if you cannot fetch URLs.',
     '',
     o.chairAddress ? `Your handle is ${o.handle}. The chair is ${o.chairAddress}.` : `Your handle is ${o.handle}.`,
     ...(o.consoleHandle !== undefined && o.consoleHandle !== o.handle
@@ -187,8 +218,9 @@ export const consoleMessages = {
       ? 'Seat lifecycle: burst. Deliver this turn\'s work, then sign off with fp:bye; a fresh code comes with the next turn.'
       : 'Seat lifecycle: standing. Between tasks post state going-idle and STAY seated; keep your MCP session and you keep the seat. Post fp:bye only when leaving for good.',
     '',
-    "Redeem with redeem_seat_code, then follow the server's instructions block; it carries the wire " +
-      'schema and the room ceremony.',
+    "Once seated, follow the server's instructions block; it carries the wire schema and the room ceremony. " +
+      'If any step fails, tell your human exactly what failed and stop; never retry blindly or improvise ' +
+      'another way in.',
   ],
   confirmRevoke: (handles: string[]) =>
     `Revoke ${handles.join(', ')}? The seat stops posting and reading at the moment of revocation; ` +

@@ -201,6 +201,253 @@ test('write-upgrade: lapsed hand-off (404 poll) re-registers on the next tick', 
   server.close();
 });
 
+// Precedent #7 (hardening brief): done/stop used to run BEFORE the persist
+// callback, so a callback throw discarded the one-shot released PAT and the
+// poller never ran again - the human authenticated in the browser and was left
+// silently unauthenticated. The release must be held in memory and the callback
+// retried; the server is never re-polled for a release it will not repeat.
+test('write-upgrade: a failing onGranted is retried from memory, not discarded', async () => {
+  let releaseServed = 0;
+  let pollsAfterRelease = 0;
+  const { server, baseUrl } = await fakeGrantServer({
+    register: () => [200, { ExpiresAt: new Date().toISOString() }],
+    poll: () => {
+      if (releaseServed) { pollsAfterRelease += 1; return [404, {}]; } // one-shot: gone
+      releaseServed = 1;
+      return [200, { Status: 'complete', Token: 'fp_fragile_grant' }];
+    },
+  });
+  const granted = once();
+  let attempts = 0;
+  const silenced = console.error;
+  console.error = () => {};
+  const controller = new WriteUpgradeController(
+    () => createAuthApiClient(baseUrl, 'fp_readonly'),
+    (token) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('config write failed');
+      granted.resolve(token);
+    },
+    () => granted.resolve('SKIPPED?!'),
+    20,
+  );
+  try {
+    controller.ensureStarted();
+    assert.equal(await granted.promise, 'fp_fragile_grant', 'the grant survived the persist failure');
+    assert.equal(attempts, 2, 'the callback was retried');
+    assert.equal(pollsAfterRelease, 0, 'the one-shot release was never re-polled');
+  } finally {
+    console.error = silenced;
+    controller.stop();
+    server.close();
+  }
+});
+
+test('device-flow: a failing onToken is retried from memory, not discarded', async () => {
+  const { createAnonApiClient } = await import('../dist/lib/anon-api.js');
+  const { DeviceFlowController } = await import('../dist/lib/device-flow.js');
+  let releaseServed = 0;
+  let pollsAfterRelease = 0;
+  const server = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const json = (status, payload) => {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      };
+      if (req.url === '/api/v1/anon/device/start') return json(200, { ExpiresAt: new Date().toISOString() });
+      if (req.url === '/api/v1/anon/device/poll') {
+        if (releaseServed) { pollsAfterRelease += 1; return json(404, {}); }
+        releaseServed = 1;
+        return json(200, { Status: 'complete', Token: 'fp_claimed_once' });
+      }
+      return json(404, {});
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const client = createAnonApiClient(`http://127.0.0.1:${server.address().port}`);
+  const claimed = once();
+  let attempts = 0;
+  const silenced = console.error;
+  console.error = () => {};
+  const controller = new DeviceFlowController(
+    client,
+    (token) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('config write failed');
+      claimed.resolve(token);
+    },
+    20,
+  );
+  try {
+    controller.ensureStarted({ token: 'anontok', sessionSlug: 's', endpointSlug: 'e', expiresAt: new Date(Date.now() + 3600e3).toISOString(), captureCount: 0, capturesCap: 250, anonBaseUrl: client.baseUrl, createdAt: new Date().toISOString() });
+    assert.equal(await claimed.promise, 'fp_claimed_once', 'the claim survived the persist failure');
+    assert.equal(attempts, 2, 'the callback was retried');
+    assert.equal(pollsAfterRelease, 0, 'the one-shot release was never re-polled');
+  } finally {
+    console.error = silenced;
+    controller.stop();
+    server.close();
+  }
+});
+
+// Review finding 3 (the round-2 pass): the pending-delivery retry must neither
+// re-enter a slow callback (double-invoking on the same one-shot token) nor
+// retry a deterministic failure forever.
+test('write-upgrade: a slow onGranted is never invoked concurrently and runs once', async () => {
+  const { server, baseUrl } = await fakeGrantServer({
+    register: () => [200, { ExpiresAt: new Date().toISOString() }],
+    poll: () => [200, { Status: 'complete', Token: 'fp_slow_grant' }],
+  });
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let calls = 0;
+  const granted = once();
+  const controller = new WriteUpgradeController(
+    () => createAuthApiClient(baseUrl, 'fp_readonly'),
+    async (token) => {
+      calls += 1;
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 120)); // far slower than the 15ms interval
+      inFlight -= 1;
+      granted.resolve(token);
+    },
+    () => granted.resolve('SKIPPED?!'),
+    15,
+  );
+  try {
+    controller.ensureStarted();
+    assert.equal(await granted.promise, 'fp_slow_grant');
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(maxInFlight, 1, 'no concurrent deliveries of the one-shot grant');
+    assert.equal(calls, 1, 'the callback ran exactly once');
+  } finally {
+    controller.stop();
+    server.close();
+  }
+});
+
+test('write-upgrade: a deterministically failing onGranted stands down after the attempt cap', async () => {
+  const { server, baseUrl } = await fakeGrantServer({
+    register: () => [200, { ExpiresAt: new Date().toISOString() }],
+    poll: () => [200, { Status: 'complete', Token: 'fp_cursed_grant' }],
+  });
+  let attempts = 0;
+  const silenced = console.error;
+  const lines = [];
+  console.error = (line) => lines.push(String(line));
+  const controller = new WriteUpgradeController(
+    () => createAuthApiClient(baseUrl, 'fp_readonly'),
+    () => { attempts += 1; throw new Error('disk says no'); },
+    () => { throw new Error('no skip expected'); },
+    10,
+  );
+  try {
+    controller.ensureStarted();
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal(attempts, 5, 'exactly the attempt cap, then no more');
+    assert.ok(lines.some((l) => /Giving up/.test(l)), 'the stand-down names the manual path');
+  } finally {
+    console.error = silenced;
+    controller.stop();
+    server.close();
+  }
+});
+
+// Round 3: the tick-entry latch alone missed polls ALREADY in flight when the
+// release landed - two overlapping poll responses both reached deliverGrant and
+// ran the callback twice on the one-shot token. The guard lives inside the
+// shared BoundedDelivery now; this drives the real race: slow poll responses,
+// fast interval, the server answering 'complete' to every in-flight poll.
+test('write-upgrade: overlapping in-flight polls cannot double-run the one-shot callback', async () => {
+  const server = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const answer = (status, payload) => {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      };
+      if (req.url === '/api/v1/device/write-upgrade') return answer(200, { ExpiresAt: new Date().toISOString() });
+      // Every poll answers complete - but SLOWLY (60ms), far beyond the 10ms
+      // interval, so several polls are in flight when the first release lands.
+      if (req.url === '/api/v1/anon/device/poll') {
+        setTimeout(() => answer(200, { Status: 'complete', Token: 'fp_raced_grant' }), 60);
+        return;
+      }
+      answer(404, {});
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  let calls = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const granted = once();
+  const controller = new WriteUpgradeController(
+    () => createAuthApiClient(baseUrl, 'fp_readonly'),
+    async (token) => {
+      calls += 1;
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 80)); // slow persist: the race window
+      inFlight -= 1;
+      granted.resolve(token);
+    },
+    () => granted.resolve('SKIPPED?!'),
+    10,
+  );
+  try {
+    controller.ensureStarted();
+    assert.equal(await granted.promise, 'fp_raced_grant');
+    await new Promise((r) => setTimeout(r, 150)); // let straggler poll responses land
+    assert.equal(maxInFlight, 1, 'no concurrent invocation from in-flight poll responses');
+    assert.equal(calls, 1, 'the one-shot callback ran exactly once');
+  } finally {
+    controller.stop();
+    server.close();
+  }
+});
+
+// Precedent #4 (hardening brief): listen's setInterval overlapped when a batch ran
+// slower than the interval - two concurrent polls read the same pending executions
+// and forwarded the same capture twice. startSerialPoll schedules the next run only
+// after the current one completes: concurrency is structurally 1.
+test('startSerialPoll: a poll slower than the interval never overlaps itself', async () => {
+  const { startSerialPoll } = await import('../dist/lib/serial-poll.js');
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let runs = 0;
+  const loop = startSerialPoll(async () => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    runs += 1;
+    await new Promise((r) => setTimeout(r, 40)); // slower than the 5ms interval
+    inFlight -= 1;
+  }, 5);
+  await new Promise((r) => setTimeout(r, 220));
+  loop.stop();
+  const runsAtStop = runs;
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(maxInFlight, 1, 'no overlapping polls');
+  assert.ok(runs >= 3, 'the loop kept re-arming');
+  assert.ok(runs <= runsAtStop + 1, 'stop() stops the loop');
+});
+
+test('startSerialPoll: a throwing poll still re-arms', async () => {
+  const { startSerialPoll } = await import('../dist/lib/serial-poll.js');
+  let runs = 0;
+  const loop = startSerialPoll(async () => {
+    runs += 1;
+    throw new Error('poll error');
+  }, 5);
+  await new Promise((r) => setTimeout(r, 60));
+  loop.stop();
+  assert.ok(runs >= 2, 'a throw does not kill the loop');
+});
+
 // ── WS4: `flurryport join` client (invite-api) ─────────────────────────────
 function fakeInviteServer(behavior) {
   const server = createServer((req, res) => {
@@ -333,13 +580,90 @@ test('getLanding: a network failure is swallowed to null (best-effort, never bre
 // ── hashchain helper (P3): the turnkey ceremony so agents never hand-roll canon/SHA ──
 // The verify_chain tool is a thin wrapper over these; the canon rule here IS the recipe's rule.
 
-test('canon: sorted keys at every level, sig excluded, no whitespace', () => {
+test('canon: sorted keys at every level, TOP-LEVEL sig excluded, no whitespace', () => {
   // Deliberately unsorted input + a sig field that must be dropped from the canonical form.
   assert.equal(
     canon({ b: 1, a: { z: 2, y: 3 }, sig: 'ignore-me' }),
     '{"a":{"y":3,"z":2},"b":1}',
   );
   assert.equal(canon([3, { k: 1 }, 'x']), '[3,{"k":1},"x"]');
+});
+
+// Precedent #2 (hardening brief): the old canon filtered sig at EVERY depth, so a
+// nested payload.sig / moves[n].sig could be tampered while the chain read intact.
+// Only the top-level signature envelope may be excluded from its own hash.
+test('canon: NESTED sig fields are part of the canonical form', () => {
+  const a = canon({ move: 3, payload: { sig: 'inner-1', v: 1 }, sig: 'outer' });
+  const b = canon({ move: 3, payload: { sig: 'TAMPERED', v: 1 }, sig: 'outer' });
+  assert.notEqual(a, b, 'a tampered nested sig must change the canonical form');
+  assert.match(a, /inner-1/, 'the nested sig is hashed');
+  assert.ok(!a.includes('outer'), 'the top-level sig still is not');
+  // ...and inside arrays too (the moves[3].sig shape).
+  const c = canon({ moves: [{ sig: 's0', to: 'a1' }] });
+  assert.match(c, /"sig":"s0"/);
+});
+
+test('verifyChain: a tampered NESTED sig breaks the chain at the next event', () => {
+  const e0 = { game: 'g', seq: 0, prevHash: '', payload: { sig: 'inner', v: 1 } };
+  const e1 = { game: 'g', seq: 1, prevHash: sha256Hex(canon(e0)) };
+  assert.equal(verifyChain([e0, e1]).intact, true);
+  const tampered = { ...e0, payload: { sig: 'FORGED', v: 1 } };
+  const res = verifyChain([tampered, e1]);
+  assert.equal(res.intact, false, 'the forged nested sig no longer hashes to e1.prevHash');
+  assert.equal(res.brokenAt, 1);
+});
+
+// Review finding 5: a chain recorded under the pre-0.6.4 rules must read as
+// LEGACY (disclosed), never as tampered - and a genuinely tampered legacy chain
+// must not hide behind the disclosure.
+test('verifyChain: legacy chains disclose legacyIntact instead of reading as tampered', () => {
+  // Build a chain the OLD rules would have produced: nested sig excluded from
+  // the hash, so hash e0 with the nested sig stripped.
+  const e0 = { seq: 0, prevHash: '', payload: { sig: 'inner', v: 1 } };
+  const legacyHash0 = sha256Hex(canon({ seq: 0, prevHash: '', payload: { v: 1 } }));
+  const e1 = { seq: 1, prevHash: legacyHash0 };
+  const res = verifyChain([e0, e1]);
+  assert.equal(res.intact, false, 'strict rules still refuse - no silent acceptance');
+  assert.equal(res.legacyIntact, true, 'but the legacy rules vouch: not tampering');
+
+  // Round-3 fix: nextPrevHash on a legacy-intact chain is the LEGACY tail hash,
+  // so following the tool's own advice keeps the chain verifiable - before, it
+  // was the strict hash at the break point and extending poisoned the chain
+  // into broken-under-both.
+  const legacyTail = sha256Hex(canon(e1)); // e1 has no nested sig, so canon == canonLegacy for it
+  assert.equal(res.nextPrevHash, legacyTail, 'nextPrevHash is the legacy tail hash');
+  const e2 = { seq: 2, prevHash: res.nextPrevHash };
+  const extended = verifyChain([e0, e1, e2]);
+  assert.equal(extended.legacyIntact, true, 'extending with nextPrevHash keeps the chain legacy-verifiable');
+
+  // A pointerless genesis (old coercion) is the other legacy shape.
+  const g0 = { seq: 0, player: 'X' };
+  const g1 = { seq: 1, prevHash: sha256Hex(canon(g0)) };
+  const g = verifyChain([g0, g1]);
+  assert.equal(g.intact, false);
+  assert.equal(g.legacyIntact, true, 'pointerless genesis reads as legacy, not tampered');
+
+  // Genuinely tampered data verifies under NEITHER rule set.
+  const t = verifyChain([e0, { seq: 1, prevHash: 'forged' }]);
+  assert.equal(t.intact, false);
+  assert.equal(t.legacyIntact, false, 'tampering cannot hide behind the legacy disclosure');
+
+  // An intact strict chain carries no legacy field at all.
+  const s0 = { seq: 0, prevHash: '' };
+  const s1 = { seq: 1, prevHash: sha256Hex(canon(s0)) };
+  assert.equal(verifyChain([s0, s1]).legacyIntact, undefined);
+});
+
+test('verifyChain: a pointerless event fails, genesis included', () => {
+  // Before the fix a missing/non-string pointer coerced to '' and verified as
+  // genesis under the empty-string convention.
+  assert.equal(verifyChain([{ seq: 0, player: 'X' }]).intact, false, 'no prevHash field at genesis');
+  assert.equal(verifyChain([{ seq: 0, prevHash: 42 }]).intact, false, 'non-string pointer');
+  const e0 = { seq: 0, prevHash: '' };
+  const stray = { seq: 1 }; // pointerless mid-chain
+  const res = verifyChain([e0, stray]);
+  assert.equal(res.intact, false);
+  assert.equal(res.brokenAt, 1);
 });
 
 test('verifyChain: a well-formed chain is intact and yields the next prevHash', () => {

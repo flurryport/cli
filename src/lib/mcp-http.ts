@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import chalk from 'chalk';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { isLoopbackHost } from './local-forward.js';
 
 /**
  * The Streamable HTTP face of an MCP server (CLAUDE.chatgpt-mcp-requirements.md,
@@ -89,6 +90,21 @@ export interface McpHttpOptions {
   idleMs?: number;
   /** Sweep period for eviction, milliseconds. Default 60000; tests shrink it. */
   sweepMs?: number;
+  /**
+   * Extra hostnames accepted in the Host and Origin headers (hardening precedent
+   * #3): the tunnel or public room host this server is fronted by. Loopback names
+   * and the bind host are always accepted. FLURRYPORT_MCP_ALLOWED_HOSTS
+   * (comma-separated) adds more at run time. See the guard note below for when
+   * the Host check is strict.
+   */
+  allowedHosts?: string[];
+  /**
+   * Exact origins (scheme://host[:port]) allowed to send an Origin header - i.e.
+   * browser-based MCP clients the operator deliberately points here (MCP
+   * Inspector). Any OTHER present Origin is refused, 'null' included.
+   * FLURRYPORT_MCP_ALLOWED_ORIGINS (comma-separated) adds more at run time.
+   */
+  allowedOrigins?: string[];
 }
 
 export interface McpHttpHandle {
@@ -186,6 +202,31 @@ function armKeepAlive(res: ServerResponse, periodMs: number): void {
   res.once('close', () => clearInterval(timer));
 }
 
+/** Hostname out of a Host header value or origin URL; null when unparseable. */
+function headerHostname(rawHost: string): string | null {
+  try {
+    return new URL(`http://${rawHost}`).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ONE origin normalization for both the allowlist build and the incoming-header
+ * check (round 3): URL.origin drops default ports, so an operator who configures
+ * "https://rooms.example.com:443" still matches the browser's Origin header,
+ * which omits the default port. Unparseable values keep their trimmed form
+ * (they can then only match an identically-unparseable configured value).
+ */
+function normalizeOrigin(raw: string): string {
+  const trimmed = raw.trim().toLowerCase().replace(/\/$/, '');
+  try {
+    return new URL(trimmed).origin.toLowerCase();
+  } catch {
+    return trimmed;
+  }
+}
+
 export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle> {
   const sessions = new Map<string, SessionEntry>();
   const log = opts.log ?? ((line: string) => console.error(chalk.dim(line)));
@@ -193,6 +234,70 @@ export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle>
   const keepAliveMs = opts.keepAliveMs ?? DEFAULT_KEEPALIVE_MS;
   const idleMs = opts.idleMs ?? DEFAULT_IDLE_MS;
   let draining = false;
+
+  // ── Transport guard (hardening precedent #3, tightened by the review round) ──
+  // DNS rebinding drives a victim's BROWSER at a loopback-bound server under an
+  // attacker-controlled Host; no expected MCP client is a browser at all.
+  //
+  // HOST: strict when bound to loopback (the rebinding-vulnerable case; loopback
+  // per local-forward's shared isLoopbackHost - 127/8, *.localhost, ::1) or when
+  // an allowlist is configured. Loopback names, the bind host, allowedHosts, and
+  // FLURRYPORT_MCP_ALLOWED_HOSTS pass; the refusal names the escape hatch, since
+  // a tunnel-fronted loopback server (the documented remote topology) forwards
+  // the public hostname and MUST configure it. A non-loopback bind with no
+  // allowlist keeps accepting any Host (the hosted pod sits behind ingress+TLS).
+  //
+  // ORIGIN: any PRESENT Origin header is a browser talking to us and is refused
+  // - including the literal "null" (sandboxed iframes, data:/file: pages) and
+  // including loopback origins (a page on another local port is still a browser)
+  // - unless the exact origin is allowlisted via allowedOrigins /
+  // FLURRYPORT_MCP_ALLOWED_ORIGINS (full-origin match, for browser-based tools
+  // like the MCP Inspector that the operator deliberately points here).
+  //
+  // Session-id -> principal binding is the Track B OAuth lane; until an account
+  // credential exists there is nothing second to bind a session to.
+  const extraHosts = new Set(
+    [
+      ...(opts.allowedHosts ?? []),
+      ...(process.env.FLURRYPORT_MCP_ALLOWED_HOSTS ?? '').split(','),
+    ]
+      .map((h) => headerHostname(h.trim()))
+      .filter((h): h is string => !!h),
+  );
+  const allowedOrigins = new Set(
+    [
+      ...(opts.allowedOrigins ?? []),
+      ...(process.env.FLURRYPORT_MCP_ALLOWED_ORIGINS ?? '').split(','),
+    ]
+      .map((o) => (o.trim() ? normalizeOrigin(o) : ''))
+      .filter(Boolean),
+  );
+  const bindHost = opts.host.toLowerCase();
+  const strictHostCheck = isLoopbackHost(bindHost) || extraHosts.size > 0;
+  const hostAllowed = (hostname: string | null): boolean =>
+    hostname !== null && (isLoopbackHost(hostname) || hostname === bindHost || extraHosts.has(hostname));
+
+  const HOST_REFUSAL_HINT =
+    ' If this server is fronted by a tunnel or reverse proxy, allow its public hostname via ' +
+    'FLURRYPORT_MCP_ALLOWED_HOSTS (comma-separated) or the --allowed-hosts flag.';
+
+  /** Refusal reason for a request that fails the guard, or null to proceed. */
+  function refuseTransport(req: IncomingMessage, checkHost: boolean): string | null {
+    if (checkHost && strictHostCheck) {
+      const host = headerHostname(firstHeader(req.headers.host) ?? '');
+      if (!hostAllowed(host)) {
+        return `Host "${host ?? '(unparseable)'}" is not allowed on this server.` + HOST_REFUSAL_HINT;
+      }
+    }
+    const origin = firstHeader(req.headers.origin);
+    if (origin && !allowedOrigins.has(normalizeOrigin(origin))) {
+      return (
+        'Browser requests are not accepted by this server. If you are deliberately using a ' +
+        'browser-based MCP client, allow its exact origin via FLURRYPORT_MCP_ALLOWED_ORIGINS.'
+      );
+    }
+    return null;
+  }
 
   const httpServer = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
@@ -210,6 +315,17 @@ export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle>
     if (url.pathname === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end('ok');
+      return;
+    }
+    // Precedent #3: everything past the health probe passes the transport guard.
+    // /whoami skips only the HOST half: it is the #288 preflight an agent hits
+    // BEFORE the operator has necessarily configured the tunnel host, it has no
+    // side effects, and a rebound browser cannot read the cross-origin response
+    // anyway - the Origin half (browsers refused) still applies to it.
+    const refusal = refuseTransport(req, url.pathname !== '/whoami');
+    if (refusal) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: refusal }, id: null }));
       return;
     }
     // #288: the unauthenticated preflight. Cheap by design - no session, no MCP

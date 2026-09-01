@@ -6,6 +6,7 @@
  */
 
 import { recordCliNotice, versionHeader } from './version-nudge.js';
+import { parseErrorResponse } from './fetch-error.js';
 
 export const DEFAULT_ANON_URL = 'https://flurryport.dev';
 
@@ -222,42 +223,15 @@ export interface AnonApiClient {
   readonly baseUrl: string;
 }
 
-/**
- * Fold a ValidationProblem `errors` dict ({ Field: ["msg", ...] }) into the detail
- * string so validation failures TEACH the expected shape instead of answering
- * "Validation error" (agents self-correct from field messages; they cannot from a
- * label). Shared by the anon and authed clients.
- */
-export function appendFieldErrors(detail: string, errors: unknown): string {
-  if (!errors || typeof errors !== 'object') return detail;
-  const parts: string[] = [];
-  for (const [field, messages] of Object.entries(errors as Record<string, unknown>)) {
-    const list = Array.isArray(messages) ? messages.filter((m) => typeof m === 'string') : [];
-    if (list.length) parts.push(`${field}: ${list.join(' ')}`);
-  }
-  return parts.length ? `${detail} ${parts.join(' | ')}`.trim() : detail;
-}
+// Kept as a re-export so existing importers keep working; the implementation
+// (and the shared ProblemDetails parse) lives in fetch-error.ts.
+export { appendFieldErrors } from './fetch-error.js';
 
 async function parse<T>(res: Response): Promise<T> {
   // Latch the server's version-staleness notice (if any) for the meta builders.
   recordCliNotice(res);
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    let code = res.status === 404 ? 'not_found' : res.status === 429 ? 'throttled' : 'error';
-    let detail = text;
-    try {
-      const raw = JSON.parse(text) as Record<string, unknown>;
-      // TypedApplicationResult problems carry the error code in "type"/"title"; ProblemDetails uses "detail".
-      detail = (raw.detail as string) ?? (raw.title as string) ?? text;
-      // ValidationProblem bodies carry the actual field errors in `errors` — without
-      // them the agent sees a bare "Validation error" and cannot self-correct
-      // (Codex run 6: two blind retries, then it improvised off-funnel).
-      detail = appendFieldErrors(detail, raw.errors);
-      if (typeof raw.type === 'string' && !raw.type.startsWith('http')) code = raw.type;
-      else if (typeof raw.title === 'string' && /^[a-z_]+$/.test(raw.title)) code = raw.title;
-    } catch {
-      /* not JSON */
-    }
+    const { code, detail } = await parseErrorResponse(res);
     throw new AnonApiError(res.status, code, detail);
   }
   return res.json() as Promise<T>;

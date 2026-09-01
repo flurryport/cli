@@ -16,6 +16,7 @@ import {
   claimUrl,
   resolveWebBaseUrl,
 } from './mcp-meta.js';
+import { sanitizeOutboundError } from './fetch-error.js';
 import { fail, ok } from './mcp-response.js';
 import { forwardCaptureToLocal, validateLocalUrl } from './local-forward.js';
 import { fetchPlanCatalog, resolveBillingBaseUrl } from './plans-api.js';
@@ -96,8 +97,8 @@ function mapAnonError(err: unknown, session: StoredAnonSession) {
     }
     return fail({ code: err.code, message: err.detail || err.message }, buildAnonMeta(session));
   }
-  const message = err instanceof Error ? err.message : String(err);
-  return fail({ code: 'error', message }, buildAnonMeta(session));
+  // Precedent #8: an unknown error's raw message can name internal cluster hosts.
+  return fail(sanitizeOutboundError(err), buildAnonMeta(session));
 }
 
 /** Decode the base64 body to text when it is printable; otherwise pass base64 through. */

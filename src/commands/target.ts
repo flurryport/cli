@@ -138,7 +138,7 @@ async function selectProject(projects: Project[], slug: string | undefined): Pro
     return match;
   }
   if (projects.length === 1) {
-    console.log(chalk.dim(`Project:  ${projects[0].Slug} (${projects[0].Name}) — only one available`));
+    console.log(chalk.dim(`Project:  ${projects[0].Slug} (${projects[0].Name}) - only one available`));
     return projects[0];
   }
   return pickFromList('Pick a project:', projects, (p) => `${p.Slug} ${chalk.dim(`(${p.Name})`)}`);
@@ -156,7 +156,7 @@ async function selectEndpoint(endpoints: Endpoint[], slug: string | undefined): 
     return match;
   }
   if (endpoints.length === 1) {
-    console.log(chalk.dim(`Endpoint: ${endpoints[0].Slug} (${endpoints[0].Name}) — only one available`));
+    console.log(chalk.dim(`Endpoint: ${endpoints[0].Slug} (${endpoints[0].Name}) - only one available`));
     return endpoints[0];
   }
   return pickFromList('Pick an endpoint:', endpoints, (e) => `${e.Slug} ${chalk.dim(`(${e.Name})`)}`);

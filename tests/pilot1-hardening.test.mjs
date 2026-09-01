@@ -138,6 +138,31 @@ test('nudge: a version-free notice passes through (the server may know better)',
   assert.equal(takeCliUpdateNotice(), null);
 });
 
+test('nudge: an identical advisory surfaces once per process; a changed message surfaces anew', async () => {
+  // 2026-08-31 incident: seven identical banners rode seven successful calls and
+  // trained the agent to read past all of them. Dedupe per message, not per session
+  // event - the server escalating with NEW text must still land.
+  const { resetCliNoticeDedupeForTest, peekCliUpdateNotice } = await import('../dist/lib/version-nudge.js');
+  resetCliNoticeDedupeForTest();
+
+  recordCliNotice(noticeResponse('flurryport 99.0.0 is available (dedupe drill).'));
+  const first = takeCliUpdateNotice();
+  assert.ok(first);
+  assert.equal(first.severity, 'advisory');
+  recordCliNotice(noticeResponse('flurryport 99.0.0 is available (dedupe drill).'));
+  assert.equal(takeCliUpdateNotice(), null, 'identical advisory must not repeat');
+  // get_server_info's verdict surface peeks past the dedupe and stays truthful.
+  const peeked = peekCliUpdateNotice();
+  assert.ok(peeked, 'peek must still answer after the relay');
+  assert.equal(takeCliUpdateNotice(), null, 'a peek is not a relay and must not re-arm anything');
+
+  recordCliNotice(noticeResponse('flurryport 99.0.1 shipped; your collaboration tooling is superseded.'));
+  const escalated = takeCliUpdateNotice();
+  assert.ok(escalated, 'changed message must surface anew');
+
+  resetCliNoticeDedupeForTest();
+});
+
 // ───────────────────────── D. deliverIntent core ─────────────────────────
 
 const CAPTURE_GUID = '01234567-89ab-cdef-0123-456789abcdef';

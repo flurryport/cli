@@ -15,6 +15,7 @@ import { base62ToGuid, guidToBase62 } from './base62.js';
 import { fetchPlanCatalog, resolveBillingBaseUrl } from './plans-api.js';
 import type { AnyMetaEnvelope, LimitOption, MetaBurst, MetaEnvelope, MetaNotice, McpErrorPayload } from './mcp-meta.js';
 import { burstFromPing, minutesUntil, resolveWebBaseUrl } from './mcp-meta.js';
+import { sanitizeOutboundError } from './fetch-error.js';
 import { fail, ok } from './mcp-response.js';
 import { takeCliUpdateNotice } from './version-nudge.js';
 import { toUtcIso, utcMs } from './time.js';
@@ -52,6 +53,12 @@ export interface ClaimHandoffInfo {
 export interface AuthToolContext {
   client: AuthApiClient;
   allowLan: boolean;
+  /**
+   * This SESSION's mutable state (precedent #1): claim scope, one-time notices,
+   * scope-discovery cache. REQUIRED so no construction site can fall back to
+   * shared module state - one process hosts many sessions over HTTP.
+   */
+  session: AuthSessionState;
   /** Present when this toolset was activated by a device-flow claim (0.2.3 breadcrumb). */
   claimHandoff?: ClaimHandoffInfo;
   /**
@@ -71,7 +78,7 @@ export interface AuthToolContext {
   fixedScope?: { projectId: string; endpointId: string; endpointSlug?: string };
   /** post_intent's signing key source, replacing the disk keystore's chooseIntentKey. */
   intentKey?: () => { key: string; header?: string; keyRef?: string } | null;
-  /** 'none' skips plan reads and the shared planCache entirely (authMeta(null) degrades safely). */
+  /** 'none' skips plan reads and the session's plan cache entirely (authMeta(null) degrades safely). */
   quota?: 'none';
   /** Consulted FIRST by authMeta: the returned envelope replaces the authed one wholesale. */
   metaOverride?: () => AnyMetaEnvelope;
@@ -90,17 +97,46 @@ export interface AuthToolContext {
 }
 
 /**
- * Post-claim orientation state (agent feedback, 0.2.3): the flip invalidates every id
- * the agent knew, so the first authed responses carry a one-time session_claimed notice
- * with the migrated ids, and id-taking tools fall back to the claimed scope when the
- * agent omits arguments.
+ * Per-SESSION mutable state (hardening precedent #1). One process may host MANY
+ * concurrent sessions (--http, the seat server, the Track B account principal), so
+ * nothing session-scoped may live at module level: a module-global claim scope let
+ * session A's claim leak into session B's default scope (cross-tenant reads and
+ * writes on A's endpoint when B omitted ids), and B's next response consumed A's
+ * one-time notices. Every AuthToolContext carries its own instance; stdio mode
+ * simply has one.
  */
-let claimScope: ClaimHandoffInfo | null = null;
-let pendingClaimNotice: MetaNotice | null = null;
+export interface AuthSessionState {
+  /** Post-claim default scope (0.2.3): claimed ids answer omitted-id tools. */
+  claimScope: ClaimHandoffInfo | null;
+  /** One-time session_claimed notice, consumed by this session's next meta. */
+  pendingClaimNotice: MetaNotice | null;
+  /** One-time write-grant outcome notice (in-flow write grant, 2026-07-20). */
+  pendingWriteNotice: MetaNotice | null;
+  /** Default-scope discovery cache + last diagnosis (run-5 finding 29). */
+  discoveredScope: { value: ScopeDiscovery; fetchedAt: number } | null;
+  lastScopeDiagnosis: ScopeDiscovery | null;
+  /** Plan + slug caches, PER SESSION (review finding 4): one process may host many
+   * principals, and quota/slug data is tenant data - it must never render in
+   * another session's meta or links. */
+  planCache: Map<string, { plan: ProjectPlanInfo; fetchedAt: number }>;
+  slugCache: Map<string, { slug: string; fetchedAt: number }>;
+}
 
-function takeClaimNotice(): MetaNotice | null {
-  const notice = pendingClaimNotice;
-  pendingClaimNotice = null;
+export function createAuthSessionState(): AuthSessionState {
+  return {
+    claimScope: null,
+    pendingClaimNotice: null,
+    pendingWriteNotice: null,
+    discoveredScope: null,
+    lastScopeDiagnosis: null,
+    planCache: new Map(),
+    slugCache: new Map(),
+  };
+}
+
+function takeClaimNotice(session: AuthSessionState): MetaNotice | null {
+  const notice = session.pendingClaimNotice;
+  session.pendingClaimNotice = null;
   return notice;
 }
 
@@ -109,10 +145,10 @@ function takeClaimNotice(): MetaNotice | null {
  * claim flip (mcp.ts) — under the unified toolset (lesson 24) the flip re-registers
  * NOTHING, so this is the only registration-independent way the breadcrumb lands.
  */
-export function announceClaim(handoff: ClaimHandoffInfo): void {
-  claimScope = handoff;
+export function announceClaim(session: AuthSessionState, handoff: ClaimHandoffInfo): void {
+  session.claimScope = handoff;
   const { captureCount, endpointSlug } = handoff;
-  pendingClaimNotice = {
+  session.pendingClaimNotice = {
     code: 'session_claimed',
     message:
       `Anonymous session claimed. ${captureCount} capture${captureCount === 1 ? '' : 's'} migrated to ` +
@@ -128,10 +164,8 @@ export function announceClaim(handoff: ClaimHandoffInfo): void {
  * session_claimed pattern: the next authed response carries it exactly once.
  * Called by the WriteUpgradeController callbacks in mcp.ts.
  */
-let pendingWriteNotice: MetaNotice | null = null;
-
-export function announceWriteDecision(granted: boolean): void {
-  pendingWriteNotice = granted
+export function announceWriteDecision(session: AuthSessionState, granted: boolean): void {
+  session.pendingWriteNotice = granted
     ? {
         code: 'write_granted',
         message:
@@ -151,9 +185,9 @@ export function announceWriteDecision(granted: boolean): void {
       };
 }
 
-function takeWriteNotice(): MetaNotice | null {
-  const notice = pendingWriteNotice;
-  pendingWriteNotice = null;
+function takeWriteNotice(session: AuthSessionState): MetaNotice | null {
+  const notice = session.pendingWriteNotice;
+  session.pendingWriteNotice = null;
   return notice;
 }
 
@@ -169,8 +203,6 @@ interface ScopeDiscovery {
   endpointSlug: string | null;
   problem: 'no_projects' | 'many_projects' | 'no_endpoints' | 'many_endpoints' | 'unreachable' | null;
 }
-let discoveredScope: { value: ScopeDiscovery; fetchedAt: number } | null = null;
-let lastScopeDiagnosis: ScopeDiscovery | null = null;
 const SCOPE_TTL_MS = 5 * 60_000;
 
 async function discoverScope(ctx: AuthToolContext): Promise<ScopeDiscovery> {
@@ -184,10 +216,14 @@ async function discoverScope(ctx: AuthToolContext): Promise<ScopeDiscovery> {
       problem: null,
     };
   }
+  const session = ctx.session;
+  const claimScope = session.claimScope;
   if (claimScope) {
     return { projectId: claimScope.projectId, endpointId: claimScope.endpointId, endpointSlug: claimScope.endpointSlug, problem: null };
   }
-  if (discoveredScope && Date.now() - discoveredScope.fetchedAt < SCOPE_TTL_MS) return discoveredScope.value;
+  if (session.discoveredScope && Date.now() - session.discoveredScope.fetchedAt < SCOPE_TTL_MS) {
+    return session.discoveredScope.value;
+  }
   let value: ScopeDiscovery;
   try {
     const projects = (await ctx.client.get('/api/v1/projects')) as { Projects?: Array<{ Id: string }> };
@@ -210,11 +246,11 @@ async function discoverScope(ctx: AuthToolContext): Promise<ScopeDiscovery> {
   } catch {
     // Not cached: a transient failure (or a scoped credential that cannot enumerate)
     // should not poison five minutes of scope resolution.
-    lastScopeDiagnosis = { projectId: null, endpointId: null, endpointSlug: null, problem: 'unreachable' };
-    return lastScopeDiagnosis;
+    session.lastScopeDiagnosis = { projectId: null, endpointId: null, endpointSlug: null, problem: 'unreachable' };
+    return session.lastScopeDiagnosis;
   }
-  discoveredScope = { value, fetchedAt: Date.now() };
-  lastScopeDiagnosis = value;
+  session.discoveredScope = { value, fetchedAt: Date.now() };
+  session.lastScopeDiagnosis = value;
   return value;
 }
 
@@ -270,8 +306,8 @@ function stampedScope(
 }
 
 /** Accurate ambiguous_scope error from the last discovery — never a guessed diagnosis. */
-function scopeFailure(need: 'project' | 'endpoint'): { code: string; message: string } {
-  const p = lastScopeDiagnosis?.problem ?? null;
+function scopeFailure(ctx: AuthToolContext, need: 'project' | 'endpoint'): { code: string; message: string } {
+  const p = ctx.session.lastScopeDiagnosis?.problem ?? null;
   const message =
     p === 'no_projects'
       ? 'This account has no projects yet, so there is nothing to scope to.'
@@ -320,16 +356,15 @@ function writeTokenGuide(): string {
  * cached for the process because a slug changes about as often as a project is renamed,
  * and they only happen on paths that already ended in a human doing something.
  */
-const slugCache = new Map<string, { slug: string; fetchedAt: number }>();
 const SLUG_TTL_MS = 5 * 60_000;
 
 async function slugFor(ctx: AuthToolContext, path: string, cacheKey: string): Promise<string | null> {
-  const cached = slugCache.get(cacheKey);
+  const cached = ctx.session.slugCache.get(cacheKey);
   if (cached && Date.now() - cached.fetchedAt < SLUG_TTL_MS) return cached.slug;
   try {
     const row = (await ctx.client.get(path)) as { Slug?: string };
     if (typeof row.Slug === 'string' && row.Slug.length > 0) {
-      slugCache.set(cacheKey, { slug: row.Slug, fetchedAt: Date.now() });
+      ctx.session.slugCache.set(cacheKey, { slug: row.Slug, fetchedAt: Date.now() });
       return row.Slug;
     }
   } catch { /* a link is a courtesy; never let it break the answer */ }
@@ -365,18 +400,17 @@ async function endpointAction(
 }
 
 /** Plan cache: authenticated meta needs plan quota without a per-call round-trip. */
-const planCache = new Map<string, { plan: ProjectPlanInfo; fetchedAt: number }>();
 const PLAN_TTL_MS = 5 * 60_000;
 
 async function getPlan(ctx: AuthToolContext, projectId: string): Promise<ProjectPlanInfo | null> {
   // Seat sessions (quota 'none') never read plans and never touch the shared cache —
   // the cache is keyed by project and one process serves many seat principals.
   if (ctx.quota === 'none') return null;
-  const cached = planCache.get(projectId);
+  const cached = ctx.session.planCache.get(projectId);
   if (cached && Date.now() - cached.fetchedAt < PLAN_TTL_MS) return cached.plan;
   try {
     const plan = (await ctx.client.get(`/api/v1/projects/${projectId}/plan`)) as unknown as ProjectPlanInfo;
-    planCache.set(projectId, { plan, fetchedAt: Date.now() });
+    ctx.session.planCache.set(projectId, { plan, fetchedAt: Date.now() });
     return plan;
   } catch {
     return cached?.plan ?? null;
@@ -392,7 +426,7 @@ async function getPlan(ctx: AuthToolContext, projectId: string): Promise<Project
  */
 async function freshPlanAfterCapture(ctx: AuthToolContext, projectId: string): Promise<ProjectPlanInfo | null> {
   if (ctx.quota === 'none') return null; // seat sessions: no plan reads, no shared-cache writes
-  planCache.delete(projectId);
+  ctx.session.planCache.delete(projectId);
   return getPlan(ctx, projectId);
 }
 
@@ -400,14 +434,14 @@ const NEARING_CAP_RATIO = 0.9;
 
 /** Authenticated meta (spec §5 note + §12.2): plan quota + retention deadline + upgrade upsell. */
 function authMeta(
+  ctx: AuthToolContext,
   plan: ProjectPlanInfo | null,
   opts: { throttled?: boolean; retryAfterSeconds?: number; oldestCaptureAt?: string; burst?: MetaBurst | null } = {},
-  override?: (() => AnyMetaEnvelope) | null,
 ): AnyMetaEnvelope {
   // Seat sessions (0.5.0): the seat envelope replaces the authed one wholesale, and
   // it replaces it HERE so envelope assembly stays in one place — callers never
   // re-parse emitted JSON, and the one-time notice latches below stay unconsumed.
-  if (override) return override();
+  if (ctx.metaOverride) return ctx.metaOverride();
   const used = plan?.CurrentMonthCaptures ?? 0;
   const cap = plan && plan.MaxMonthlyCaptures > 0 ? plan.MaxMonthlyCaptures : null;
   const remaining = cap !== null ? Math.max(0, cap - used) : null;
@@ -480,23 +514,23 @@ function authMeta(
     upsell,
     // Claim outranks write-grant when both are somehow pending; each fires once. The
     // staleness nudge is lowest precedence and re-fires while the server keeps sending it.
-    notice: takeClaimNotice() ?? takeWriteNotice() ?? takeCliUpdateNotice(),
+    notice: takeClaimNotice(ctx.session) ?? takeWriteNotice(ctx.session) ?? takeCliUpdateNotice(),
   };
 }
 
-function mapAuthError(err: unknown, plan: ProjectPlanInfo | null, override?: (() => AnyMetaEnvelope) | null) {
+function mapAuthError(ctx: AuthToolContext, err: unknown, plan: ProjectPlanInfo | null) {
   if (err instanceof AuthApiError) {
     if (err.status === 429) {
       return fail(
         { code: 'throttled', message: err.detail || 'Rate limited. Slow down.', retryAfterSeconds: 30 },
-        authMeta(plan, { throttled: true, retryAfterSeconds: 30 }, override),
+        authMeta(ctx, plan, { throttled: true, retryAfterSeconds: 30 }),
       );
     }
     // 404 is also the cross-tenant / bad-id answer (spec §12.7) — non-enumerable.
-    return fail({ code: err.code, message: err.detail || err.message }, authMeta(plan, {}, override));
+    return fail({ code: err.code, message: err.detail || err.message }, authMeta(ctx, plan));
   }
-  const message = err instanceof Error ? err.message : String(err);
-  return fail({ code: 'error', message }, authMeta(plan, {}, override));
+  // Precedent #8: an unknown error's raw message can name internal cluster hosts.
+  return fail(sanitizeOutboundError(err), authMeta(ctx, plan));
 }
 
 /** Register a plain read tool: GET the path, opaque the ids, wrap in meta. */
@@ -521,9 +555,9 @@ function read(
       const plan = projectId ? await getPlan(ctx, projectId) : null;
       try {
         const result = await ctx.client.get(pathFor(args));
-        return ok(opaqueIds(result), authMeta(plan, {}, ctx.metaOverride));
+        return ok(opaqueIds(result), authMeta(ctx, plan));
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -545,7 +579,7 @@ async function resolveCollectionScope(
     return {
       error: fail(
         { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-        authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+        authMeta(ctx, await anyCachedPlan(ctx)),
       ),
     };
   }
@@ -558,14 +592,14 @@ async function resolveCollectionScope(
  * size rejection anywhere is Core's plan payload cap, which stores the oversize post as
  * a rejected capture.
  */
-export const POST_INTENT_MAX_BYTES = 256 * 1024;
+const POST_INTENT_MAX_BYTES = 256 * 1024;
 
 /**
  * #377: the budget an owner receipt reports, so it matches what Core enforces: the
  * declared budget capped at the plan's MaxPayloadBytes. With no plan in hand (or an
  * unlimited cap) the declared budget stands.
  */
-export function ownerMaxBytes(plan: ProjectPlanInfo | null): number {
+function ownerMaxBytes(plan: ProjectPlanInfo | null): number {
   const cap = plan?.MaxPayloadBytes;
   return typeof cap === 'number' && cap > 0 ? Math.min(POST_INTENT_MAX_BYTES, cap) : POST_INTENT_MAX_BYTES;
 }
@@ -576,17 +610,17 @@ export function bytesRemaining(maxBytes: number, sizeBytes: number): number {
 }
 
 /** #365: the wire verb a seat request carries, so a host watch can match on it. */
-export const REQUEST_SEAT_VERB = 'fp:request-seat';
+const REQUEST_SEAT_VERB = 'fp:request-seat';
 
 /** #365: a seat request is one paragraph of reason, not a document. */
-export const REQUEST_SEAT_MAX_REASON = 2000;
+const REQUEST_SEAT_MAX_REASON = 2000;
 
 /**
  * #365: who a seat request is addressed to. The roster's host if it names one,
  * otherwise the open-room address - both are audiences the capture path already
  * accepts, so the ask is never refused for where it was sent.
  */
-export function hostAddress(roster?: Array<{ Handle?: string; Role?: string }> | null): string {
+function hostAddress(roster?: Array<{ Handle?: string; Role?: string }> | null): string {
   const host = (roster ?? []).find(
     (r) => typeof r.Handle === 'string' && r.Handle.length > 0 && (r.Role ?? '').trim().toLowerCase() === 'host');
   return host?.Handle ?? 'all';
@@ -595,7 +629,7 @@ export function hostAddress(roster?: Array<{ Handle?: string; Role?: string }> |
 export function registerAuthTools(server: McpServer, ctx: AuthToolContext): void {
   const id = z.string().describe('Opaque id from a prior list_* call, verbatim.');
 
-  if (ctx.claimHandoff) announceClaim(ctx.claimHandoff);
+  if (ctx.claimHandoff) announceClaim(ctx.session, ctx.claimHandoff);
 
   server.registerTool(
     'get_capture_url',
@@ -611,7 +645,7 @@ export function registerAuthTools(server: McpServer, ctx: AuthToolContext): void
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ projectId, endpointId }) => {
-      const plan = projectId ? await getPlan(ctx, projectId) : await anyCachedPlan();
+      const plan = projectId ? await getPlan(ctx, projectId) : await anyCachedPlan(ctx);
       try {
         let scope: { projectId: string; endpointId: string; endpointSlug: string } | null = null;
         if (projectId && endpointId) {
@@ -622,8 +656,8 @@ export function registerAuthTools(server: McpServer, ctx: AuthToolContext): void
         }
         if (!scope) {
           return fail(
-scopeFailure('endpoint'),
-            authMeta(plan, {}, ctx.metaOverride),
+scopeFailure(ctx, 'endpoint'),
+            authMeta(ctx, plan),
           );
         }
         return ok(
@@ -635,15 +669,15 @@ scopeFailure('endpoint'),
             endpointSlug: scope.endpointSlug,
             // Durable orientation (run-4 feedback): the one-time session_claimed notice can be
             // consumed mid-batch and never surfaced; this block survives being missed.
-            ...(claimScope ? { claimed: { endpointSlug: claimScope.endpointSlug, migratedCaptureCount: claimScope.captureCount } } : {}),
+            ...(ctx.session.claimScope ? { claimed: { endpointSlug: ctx.session.claimScope.endpointSlug, migratedCaptureCount: ctx.session.claimScope.captureCount } } : {}),
             hint:
               'Point the webhook provider at captureUrl. Captures are permanent and encrypted on this account; ' +
               'browse them at webUrl or via list_captures.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -664,7 +698,7 @@ scopeFailure('endpoint'),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ port }) => {
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       try {
         const info = await ensureEchoServer(port);
         return ok(
@@ -674,10 +708,10 @@ scopeFailure('endpoint'),
               `Call forward_to_localhost with localUrl "${info.localUrl}" (omit captureId to forward the latest ` +
               'capture) to prove the replay loop end to end.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -736,7 +770,7 @@ scopeFailure('endpoint'),
         if (!projectId) {
           const d = await discoverScope(ctx);
           if (!d.projectId) {
-            return fail(scopeFailure('project'), authMeta(await anyCachedPlan(), {}, ctx.metaOverride));
+            return fail(scopeFailure(ctx, 'project'), authMeta(ctx, await anyCachedPlan(ctx)));
           }
           projectId = d.projectId;
         }
@@ -750,10 +784,10 @@ scopeFailure('endpoint'),
             ...(endpointId ? { endpointId } : {}),
             readAs: ctx.client.credentialFor?.(path) ?? 'signed-in account',
           }),
-          authMeta(await anyCachedPlan(), { oldestCaptureAt: result.Retention?.OldestRetainedAt }, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx), { oldestCaptureAt: result.Retention?.OldestRetainedAt }),
         );
       } catch (err) {
-        return mapAuthError(err, await anyCachedPlan(), ctx.metaOverride);
+        return mapAuthError(ctx, err, await anyCachedPlan(ctx));
       }
     },
   );
@@ -783,8 +817,8 @@ scopeFailure('endpoint'),
           const scope = await resolveDefaultScope(ctx);
           if (!scope) {
             return fail(
-              scopeFailure('endpoint'),
-              authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+              scopeFailure(ctx, 'endpoint'),
+              authMeta(ctx, await anyCachedPlan(ctx)),
             );
           }
           endpointId = scope.endpointId;
@@ -799,10 +833,10 @@ scopeFailure('endpoint'),
             ...opaqueIds(result),
             hint: 'The watch now runs against every new capture on this endpoint. Check matches with list_watches or get_capture_digest.',
           },
-          authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx)),
         );
       } catch (err) {
-        return mapAuthError(err, await anyCachedPlan(), ctx.metaOverride);
+        return mapAuthError(ctx, err, await anyCachedPlan(ctx));
       }
     },
   );
@@ -827,8 +861,8 @@ scopeFailure('endpoint'),
           const scope = await resolveDefaultScope(ctx);
           if (!scope) {
             return fail(
-              scopeFailure('endpoint'),
-              authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+              scopeFailure(ctx, 'endpoint'),
+              authMeta(ctx, await anyCachedPlan(ctx)),
             );
           }
           endpointId = scope.endpointId;
@@ -837,10 +871,10 @@ scopeFailure('endpoint'),
         const result = await ctx.client.get(path);
         return ok(
           stampedScope(opaqueIds(result), readScope(ctx, endpointId, path)),
-          authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx)),
         );
       } catch (err) {
-        return mapAuthError(err, await anyCachedPlan(), ctx.metaOverride);
+        return mapAuthError(ctx, err, await anyCachedPlan(ctx));
       }
     },
   );
@@ -864,9 +898,9 @@ scopeFailure('endpoint'),
           `/api/v1/endpoints/${endpointId}/watches/${watchId}/enabled`,
           { Enabled: enabled },
         );
-        return ok(opaqueIds(result), authMeta(await anyCachedPlan(), {}, ctx.metaOverride));
+        return ok(opaqueIds(result), authMeta(ctx, await anyCachedPlan(ctx)));
       } catch (err) {
-        return mapAuthError(err, await anyCachedPlan(), ctx.metaOverride);
+        return mapAuthError(ctx, err, await anyCachedPlan(ctx));
       }
     },
   );
@@ -904,8 +938,8 @@ scopeFailure('endpoint'),
           const scope = await resolveDefaultScope(ctx);
           if (!scope) {
             return fail(
-              scopeFailure('endpoint'),
-              authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+              scopeFailure(ctx, 'endpoint'),
+              authMeta(ctx, await anyCachedPlan(ctx)),
             );
           }
           endpointId = scope.endpointId;
@@ -922,10 +956,10 @@ scopeFailure('endpoint'),
         const oldest = items?.length ? items[items.length - 1]?.CreatedAt : undefined;
         return ok(
           stampedScope(opaqueIds(result), readScope(ctx, endpointId, path)),
-          authMeta(await anyCachedPlan(), { oldestCaptureAt: oldest }, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx), { oldestCaptureAt: oldest }),
         );
       } catch (err) {
-        return mapAuthError(err, await anyCachedPlan(), ctx.metaOverride);
+        return mapAuthError(ctx, err, await anyCachedPlan(ctx));
       }
     },
   );
@@ -957,8 +991,8 @@ scopeFailure('endpoint'),
           const scope = await resolveDefaultScope(ctx);
           if (!scope) {
             return fail(
-              scopeFailure('endpoint'),
-              authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+              scopeFailure(ctx, 'endpoint'),
+              authMeta(ctx, await anyCachedPlan(ctx)),
             );
           }
           endpointId = scope.endpointId;
@@ -973,10 +1007,10 @@ scopeFailure('endpoint'),
         const oldest = items?.length ? items[items.length - 1]?.CreatedAt : undefined;
         return ok(
           stampedScope(opaqueIds(result), readScope(ctx, endpointId, path)),
-          authMeta(await anyCachedPlan(), { oldestCaptureAt: oldest }, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx), { oldestCaptureAt: oldest }),
         );
       } catch (err) {
-        return mapAuthError(err, await anyCachedPlan(), ctx.metaOverride);
+        return mapAuthError(ctx, err, await anyCachedPlan(ctx));
       }
     },
   );
@@ -1004,7 +1038,7 @@ scopeFailure('endpoint'),
       if (!captureId) {
         return fail(
           { code: 'not_found', message: 'Pass captureId (or its alias id) from a prior list_captures row, verbatim.' },
-          authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx)),
         );
       }
       try {
@@ -1012,8 +1046,8 @@ scopeFailure('endpoint'),
           const scope = await resolveDefaultScope(ctx);
           if (!scope) {
             return fail(
-              scopeFailure('endpoint'),
-              authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+              scopeFailure(ctx, 'endpoint'),
+              authMeta(ctx, await anyCachedPlan(ctx)),
             );
           }
           endpointId = scope.endpointId;
@@ -1034,10 +1068,10 @@ scopeFailure('endpoint'),
             },
             readScope(ctx, endpointId, path),
           ),
-          authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx)),
         );
       } catch (err) {
-        return mapAuthError(err, await anyCachedPlan(), ctx.metaOverride);
+        return mapAuthError(ctx, err, await anyCachedPlan(ctx));
       }
     },
   );
@@ -1139,7 +1173,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -1152,7 +1186,7 @@ scopeFailure('endpoint'),
       } catch {
         return fail(
           { code: 'validation', message: 'A captureId is not a valid id. Pass ids verbatim from list_captures.' },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       }
       try {
@@ -1167,12 +1201,12 @@ scopeFailure('endpoint'),
               'Collection created and its captures are PINNED (retention-exempt). Verify membership with ' +
               'get_collection; add later captures with add_to_collection.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'creating collections');
         if (isLimitError(err)) return failLimit(err, plan, projectId, { endpointId });
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1203,7 +1237,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -1216,7 +1250,7 @@ scopeFailure('endpoint'),
       } catch {
         return fail(
           { code: 'validation', message: 'A captureId is not a valid id. Pass ids verbatim from list_captures.' },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       }
       try {
@@ -1231,12 +1265,12 @@ scopeFailure('endpoint'),
               'addedCount is how many actually joined (captures already in the collection are not ' +
               'double-added). The appended captures are now pinned. Verify with get_collection.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'adding to collections');
         if (isLimitError(err)) return failLimit(err, plan, projectId, { endpointId, targetId: collectionId });
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1275,7 +1309,7 @@ scopeFailure('endpoint'),
       } catch {
         return fail(
           { code: 'validation', message: 'captureId is not a valid id. Pass it verbatim from get_collection.' },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       }
       try {
@@ -1300,11 +1334,11 @@ scopeFailure('endpoint'),
               'Removed. If that capture is in no other collection it is no longer a fixture, so plan ' +
               'retention applies to it again. Verify the collection with get_collection.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'removing from collections');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1345,7 +1379,7 @@ scopeFailure('endpoint'),
       } catch {
         return fail(
           { code: 'validation', message: 'A capture id is not a valid id. Pass ids verbatim from get_collection / list_captures.' },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       }
       try {
@@ -1364,11 +1398,11 @@ scopeFailure('endpoint'),
               'Swapped in one act: the replacement is pinned and the previous item is out. itemCount is ' +
               'the size after the swap, so it should match what it was before.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'editing collections');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1395,9 +1429,9 @@ scopeFailure('endpoint'),
           const h = (await ctx.client.get(`${base}/headers`)) as { Headers?: unknown };
           deliveryHeaders = h.Headers ?? [];
         } catch { /* advisory: a header-read failure must not hide the target itself */ }
-        return ok(opaqueIds({ ...(target as Record<string, unknown>), deliveryHeaders }), authMeta(plan, {}, ctx.metaOverride));
+        return ok(opaqueIds({ ...(target as Record<string, unknown>), deliveryHeaders }), authMeta(ctx, plan));
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1433,7 +1467,7 @@ scopeFailure('endpoint'),
           endpointId = endpointId ?? scope.endpointId;
         }
       }
-      const plan = projectId ? await getPlan(ctx, projectId) : await anyCachedPlan();
+      const plan = projectId ? await getPlan(ctx, projectId) : await anyCachedPlan(ctx);
       try {
         const totals = (await ctx.client.get('/api/v1/captures/my-count')) as { Count?: number };
         const cap = plan && plan.MaxMonthlyCaptures > 0 ? plan.MaxMonthlyCaptures : null;
@@ -1443,7 +1477,7 @@ scopeFailure('endpoint'),
           monthlyCap: cap,
           capturesRemaining: cap !== null && used !== null ? Math.max(0, cap - used) : null,
           totalCapturesAllTime: totals.Count ?? null,
-          ...(claimScope ? { claimed: { endpointSlug: claimScope.endpointSlug, migratedCaptureCount: claimScope.captureCount } } : {}),
+          ...(ctx.session.claimScope ? { claimed: { endpointSlug: ctx.session.claimScope.endpointSlug, migratedCaptureCount: ctx.session.claimScope.captureCount } } : {}),
         };
         let burst: MetaBurst | null = null;
         if (projectId && endpointId) {
@@ -1483,9 +1517,9 @@ scopeFailure('endpoint'),
             /* summaries are a convenience — never fail the count over them */
           }
         }
-        return ok(payload, authMeta(plan, { burst }, ctx.metaOverride));
+        return ok(payload, authMeta(ctx, plan, { burst }));
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1527,8 +1561,8 @@ scopeFailure('endpoint'),
           const scope = await resolveDefaultScope(ctx);
           if (!scope) {
             return fail(
-scopeFailure('endpoint'),
-              authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+scopeFailure(ctx, 'endpoint'),
+              authMeta(ctx, await anyCachedPlan(ctx)),
             );
           }
           projectId = projectId ?? scope.projectId;
@@ -1536,7 +1570,7 @@ scopeFailure('endpoint'),
         }
         // Fresh plan + stats (not the 5-minute cache): refuse-before-send needs live numbers.
         plan = (await ctx.client.get(`/api/v1/projects/${projectId}/plan`)) as ProjectPlanInfo;
-        planCache.set(projectId, { plan, fetchedAt: Date.now() });
+        ctx.session.planCache.set(projectId, { plan, fetchedAt: Date.now() });
         const statsPath = `/api/v1/projects/${projectId}/endpoints/${endpointId}/capture-stats`;
         let stats = (await ctx.client.get(statsPath)) as {
           AcceptedCount: number; RejectedCount: number;
@@ -1555,7 +1589,7 @@ scopeFailure('endpoint'),
                   ? 'The monthly capture cap is used up. Nothing was sent. See meta.actions for upgrade options.'
                   : `Only ${remaining} captures remain on this month's plan quota. Nothing was sent. Send at most ${remaining}, or see meta.actions for upgrade options.`,
             },
-            authMeta(plan, { burst }, ctx.metaOverride),
+            authMeta(ctx, plan, { burst }),
           );
         }
         if (paceMode === 'none' && burst && requested > burst.remaining) {
@@ -1567,7 +1601,7 @@ scopeFailure('endpoint'),
                 'Nothing was sent. Send fewer, wait for the reset, or use pace "auto".',
               retryAfterSeconds: burst.resetsInSeconds,
             },
-            authMeta(plan, { burst }, ctx.metaOverride),
+            authMeta(ctx, plan, { burst }),
           );
         }
 
@@ -1584,7 +1618,7 @@ scopeFailure('endpoint'),
 
         // Fresh server truth after the batch, so the meta the agent relays is current.
         plan = (await ctx.client.get(`/api/v1/projects/${projectId}/plan`)) as ProjectPlanInfo;
-        planCache.set(projectId, { plan, fetchedAt: Date.now() });
+        ctx.session.planCache.set(projectId, { plan, fetchedAt: Date.now() });
         stats = (await ctx.client.get(statsPath)) as typeof stats;
         burst = burstFromPing(stats);
 
@@ -1602,10 +1636,10 @@ scopeFailure('endpoint'),
               'Signature headers are shape-realistic placeholders and will not pass real signature verification. ' +
               'Point the real provider at the capture URL for end-to-end testing.',
           },
-          authMeta(plan, { burst }, ctx.metaOverride),
+          authMeta(ctx, plan, { burst }),
         );
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1633,16 +1667,16 @@ scopeFailure('endpoint'),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ endpointId, captureId, latestCount, localUrl }) => {
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       const verdict = validateLocalUrl(localUrl, ctx.allowLan);
-      if (!verdict.ok) return fail({ code: 'validation', message: verdict.reason }, authMeta(plan, {}, ctx.metaOverride));
+      if (!verdict.ok) return fail({ code: 'validation', message: verdict.reason }, authMeta(ctx, plan));
       try {
         if (!endpointId) {
           const scope = await resolveDefaultScope(ctx);
           if (!scope) {
             return fail(
-              scopeFailure('endpoint'),
-              authMeta(plan, {}, ctx.metaOverride),
+              scopeFailure(ctx, 'endpoint'),
+              authMeta(ctx, plan),
             );
           }
           endpointId = scope.endpointId;
@@ -1667,7 +1701,7 @@ scopeFailure('endpoint'),
           if (captureIds.length === 0) {
             return fail(
               { code: 'not_found', message: 'No accepted captures on this endpoint yet. Send or capture one first.' },
-              authMeta(plan, {}, ctx.metaOverride),
+              authMeta(ctx, plan),
             );
           }
         }
@@ -1722,16 +1756,16 @@ scopeFailure('endpoint'),
           captureIds.length === 1 && captureId
             ? ({ ...(forwarded[0] as Record<string, unknown>), suggestedNextAction } as Record<string, unknown>)
             : { forwarded, suggestedNextAction },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof Error && (err.name === 'AbortError' || err instanceof TypeError)) {
           return fail(
             { code: 'local_unreachable', message: `Could not reach ${localUrl}. Is the user's app running on that port?` },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1758,7 +1792,7 @@ scopeFailure('endpoint'),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     async ({ captureId, targetId, idempotencyKey }) => {
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       // The enqueue body takes RAW GUIDs; the model holds opaque base62 ids.
       let captureGuid: string, targetGuid: string;
       try {
@@ -1767,7 +1801,7 @@ scopeFailure('endpoint'),
       } catch {
         return fail(
           { code: 'validation', message: 'captureId or targetId is not a valid id. Pass ids verbatim from prior list_* results.' },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       }
       const key = idempotencyKey ?? `mcp-${randomUUID()}`;
@@ -1783,7 +1817,7 @@ scopeFailure('endpoint'),
             idempotencyKey: key,
             status: 'queued',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) {
@@ -1793,10 +1827,10 @@ scopeFailure('endpoint'),
               message:
                 'This token is read-only, so server-side replay is blocked. ' + writeTokenGuide(),
             },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -1812,7 +1846,7 @@ scopeFailure('endpoint'),
         code: 'forbidden',
         message: `This token is read-only, so ${what} is blocked. ` + writeTokenGuide(),
       },
-      authMeta(plan, {}, ctx.metaOverride),
+      authMeta(ctx, plan),
     );
 
   // ── Limit-error enrichment (lesson 49): a plan-limit refusal enumerates the FULL
@@ -2131,7 +2165,7 @@ scopeFailure('endpoint'),
         if (evidence.occupants?.length) error.occupants = evidence.occupants;
       } catch { /* enrichment must never make the error worse */ }
     }
-    return fail(error, authMeta(plan, {}, ctx.metaOverride));
+    return fail(error, authMeta(ctx, plan));
   }
 
   const isLimitError = (err: unknown): err is AuthApiError =>
@@ -2157,7 +2191,7 @@ scopeFailure('endpoint'),
       if (!projectId) {
         const d = await discoverScope(ctx);
         if (!d.projectId) {
-          return fail(scopeFailure('project'), authMeta(await anyCachedPlan(), {}, ctx.metaOverride));
+          return fail(scopeFailure(ctx, 'project'), authMeta(ctx, await anyCachedPlan(ctx)));
         }
         projectId = d.projectId;
       }
@@ -2173,12 +2207,12 @@ scopeFailure('endpoint'),
             captureUrlPath: `/api/v1/capture/${projectId}/${result.Slug}`,
             hint: 'Point the webhook provider at the capture URL (apex host + captureUrlPath), or wire a pipe: create_replay_target, then create_transformation + bind_transformation.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'creating endpoints');
         if (isLimitError(err)) return failLimit(err, plan, projectId);
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2209,7 +2243,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -2226,12 +2260,12 @@ scopeFailure('endpoint'),
             ...opaqueIds(result),
             hint: 'Pin it live with bind_transformation (transformationId + draftVersionId + a replay target). Preview against a real capture first via the workspace, or bind with standing=false to test manually.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'creating transformations');
         if (isLimitError(err)) return failLimit(err, plan, projectId, { endpointId });
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2261,7 +2295,7 @@ scopeFailure('endpoint'),
       if (!projectId) {
         const d = await discoverScope(ctx);
         if (!d.projectId) {
-          return fail(scopeFailure('project'), authMeta(await anyCachedPlan(), {}, ctx.metaOverride));
+          return fail(scopeFailure(ctx, 'project'), authMeta(ctx, await anyCachedPlan(ctx)));
         }
         projectId = d.projectId;
       }
@@ -2279,11 +2313,11 @@ scopeFailure('endpoint'),
                 'pin the old version - re-bind with bind_transformation using the returned latestVersionId to go live.'
               : 'Draft updated in place. Bindings pinning this draft pick the change up on their next run.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'updating transformations');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2330,7 +2364,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -2397,12 +2431,12 @@ scopeFailure('endpoint'),
                     'get_capture_executions after the next capture instead.')
               : 'Manual binding created. Fire it via batch or collection runs; flip to standing later from the workspace.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'binding transformations');
         if (isLimitError(err)) return failLimit(err, plan, projectId, { endpointId });
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2457,7 +2491,7 @@ scopeFailure('endpoint'),
                 "recipe's secretNames on your consolidated requirements list instead, and run " +
                 'checkOnly after the user picks the project/endpoint and the refs are wired.',
             },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -2500,12 +2534,12 @@ scopeFailure('endpoint'),
                 : {}),
               hint:
                 state === 'no_secret_references'
-                  ? 'No secret references are wired on this endpoint yet — nothing is configured. Wire $secrets.NAME references on the target URL/headers (set_target_headers / update_replay_target), then re-check.'
+                  ? 'No secret references are wired on this endpoint yet - nothing is configured. Wire $secrets.NAME references on the target URL/headers (set_target_headers / update_replay_target), then re-check.'
                   : state === 'all_set'
-                    ? 'Every referenced secret is set — the pipe is ready. Continue wiring or fire a test intent.'
+                    ? 'Every referenced secret is set - the pipe is ready. Continue wiring or fire a test intent.'
                     : 'Still waiting on the user. Poll again in ~30s; if they lost the email, call again without checkOnly to re-send (5 min cooldown applies).',
             },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
 
@@ -2535,7 +2569,7 @@ scopeFailure('endpoint'),
               ? `Setup link emailed to ${result.MaskedEmail}. Tell your user to open that inbox and follow the link (valid 1 hour, single use). Then poll with checkOnly=true until allSet.`
               : 'The setup request was recorded but the email could not be sent. Ask your user to set the secrets on the workspace Secrets page instead.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         // #104: keep the two "nothing to email" cases distinct — zero wired
@@ -2546,21 +2580,21 @@ scopeFailure('endpoint'),
               code: 'no_secret_references',
               message: 'No secret references are wired on this endpoint yet.',
               hint:
-                'Nothing is configured — there are no $secrets.NAME references on the target URL/headers, ' +
+                'Nothing is configured - there are no $secrets.NAME references on the target URL/headers, ' +
                 'so there is nothing to request. Wire the references first (set_target_headers / ' +
                 'update_replay_target), then request setup or re-check with checkOnly=true.',
             },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
         if (err instanceof AuthApiError && err.status === 400 && /no_missing_secrets|already set/i.test(`${err.code} ${err.detail}`)) {
           return ok(
-            { allSet: true, status: 'all_set', hint: 'Every referenced secret is already set — nothing to request. The pipe is ready.' },
-            authMeta(plan, {}, ctx.metaOverride),
+            { allSet: true, status: 'all_set', hint: 'Every referenced secret is already set - nothing to request. The pipe is ready.' },
+            authMeta(ctx, plan),
           );
         }
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'requesting secret setup');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2569,13 +2603,13 @@ scopeFailure('endpoint'),
     'create_invite',
     {
       description:
-        'Mint an invite link so another person and their agent can join an endpoint you own. Inputs: role ' +
+        'Mint an invite link so another PERSON and their agent can join an endpoint you own. NOT for ' +
+        'seating an AI agent in a room: agents join by pairing code (mint_seat); seat connectors cannot ' +
+        'redeem invite links. Inputs: role ' +
         '"producer" to send events in or "monitor" to read only, displayName for who the invite is from, ' +
         'guestName for what to call the participant, recipeRef for the recipe the landing page should ' +
         'name, and endpointId, or omit it for the claimed or only endpoint. ASK YOUR USER for displayName ' +
-        'and guestName; never invent either. guestName becomes that participant\'s one identity: the ' +
-        'signer label on their posts, the watch label others orient by, and the account name their CLI ' +
-        'stores the grant under. Returns inviteUrl, shown ONCE, so relay it to the user immediately. ' +
+        'and guestName; never invent either. Returns inviteUrl, shown ONCE, so relay it to the user immediately. ' +
         'Invites last 7 days and the owner can revoke them with revoke_invite. You never see or supply an ' +
         'email address; sharing the link is the user\'s job.',
       inputSchema: {
@@ -2601,12 +2635,12 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass endpointId from list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         endpointId = scope.endpointId;
       }
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       try {
         const res = (await ctx.client.post(`/api/v1/endpoints/${endpointId}/invites`, {
           Role: role,
@@ -2620,6 +2654,7 @@ scopeFailure('endpoint'),
           Role: string;
           ExpiresAt: string;
           LandingPath: string;
+          SeatFlowNote?: string | null;
         };
         return ok(
           {
@@ -2627,17 +2662,21 @@ scopeFailure('endpoint'),
             ref: res.Ref,
             role: res.Role,
             expiresAt: res.ExpiresAt,
+            // Server-side invite-vs-pairing-code distinction (2026-08-31 incident):
+            // present when recipeRef resolved to a room recipe. Relay it.
+            ...(res.SeatFlowNote ? { seatFlowNote: res.SeatFlowNote } : {}),
             hint:
-              'Give inviteUrl to your user to share with their friend now - this is the only time it is ' +
-              'shown. The friend\'s agent fetches it as JSON and sets itself up; a browser shows a human ' +
-              'explanation. The ref identifies this invite in the endpoint\'s invite list; the owner can ' +
-              'revoke it from there.',
+              'Give inviteUrl to your user to share with the invited PERSON now - this is the only time ' +
+              'it is shown. The person accepts it in a browser as themselves; their agent then collects ' +
+              'its credential through the landing page\'s JSON rendering. An invite never seats an AI ' +
+              'agent in a room (that is mint_seat\'s pairing code). The ref identifies this invite in ' +
+              'the endpoint\'s invite list; the owner can revoke it from there.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'minting an invite');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2657,7 +2696,8 @@ scopeFailure('endpoint'),
         'Mint a seat pairing code so ANOTHER AI agent can take a seat in a room on an endpoint you own. ' +
         'Inputs: guestName for the seat\'s byline on every post, hours for the seat life, codeMinutes for ' +
         'how long the unredeemed code lives, lifecycle for the pass\'s stay-or-go rule (standing or ' +
-        'burst), seatServerUrl, and projectId plus endpointId. ASK YOUR USER ' +
+        'burst), senderName for the pass preamble (ask your user; omit for a neutral opening), ' +
+        'seatServerUrl, and projectId plus endpointId. ASK YOUR USER ' +
         'for guestName; never invent one. Returns the pairing code plus passText, the boarding pass: relay ' +
         'passText to your user VERBATIM to ferry to the joining agent. The code is single use and dies 10 ' +
         'minutes after the mint by default; raise codeMinutes when the handoff will take longer, and it ' +
@@ -2687,6 +2727,9 @@ scopeFailure('endpoint'),
           .describe('The chair\'s wire address printed on the pass (the name seats send answers to). ' +
             'Omit to use the address the console seeded on this machine; if neither exists the pass ' +
             'omits the chair sentence.'),
+        senderName: z.string().max(100).optional()
+          .describe('Human sender\'s name for the pass preamble. Ask your user, never invent it; ' +
+            'omitted, the neutral fallback opens.'),
         lifecycle: z.enum(['standing', 'burst']).optional()
           .describe('The stay-or-go rule printed on the pass; default standing (post going-idle between ' +
             'tasks, stay seated). burst: deliver this turn, sign off with fp:bye, fresh code next turn.'),
@@ -2699,11 +2742,11 @@ scopeFailure('endpoint'),
       },
       annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ projectId, endpointId, guestName, hours, codeMinutes: codeMinutesOpt, seatServerUrl, chairAddress, lifecycle, standing, standingCheckedInOnly }) => {
+    async ({ projectId, endpointId, guestName, hours, codeMinutes: codeMinutesOpt, seatServerUrl, chairAddress, senderName, lifecycle, standing, standingCheckedInOnly }) => {
       // #284a mint-surface hygiene: a quoted or padded name would mint literally and
       // the console grammar could never address it. Same rule, every mint surface.
       const cleaned = sanitizeGuestName(guestName);
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       if (cleaned.length === 0) {
         return fail(
           {
@@ -2712,13 +2755,13 @@ scopeFailure('endpoint'),
               'Nothing is left of guestName once the surrounding quotes and whitespace are stripped. ' +
               'Pass a real name for the seat.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       }
       try {
         if (!endpointId) {
           const scope = await resolveDefaultScope(ctx);
-          if (!scope) return fail(scopeFailure('endpoint'), authMeta(plan, {}, ctx.metaOverride));
+          if (!scope) return fail(scopeFailure(ctx, 'endpoint'), authMeta(ctx, plan));
           endpointId = scope.endpointId;
           projectId = projectId ?? scope.projectId;
         }
@@ -2767,6 +2810,8 @@ scopeFailure('endpoint'),
                 room,
                 // #412: the stay-or-go rule is structural on every pass.
                 lifecycle: lifecycle ?? 'standing',
+                // Pass-copy sitting 2026-08-31: the preamble's one fill slot.
+                senderName: senderName ?? null,
               })
               .join('\n'),
             hint:
@@ -2776,7 +2821,7 @@ scopeFailure('endpoint'),
               'seatExpiresAt; posting and reading stop then, the log keeps its bylines. The joining agent ' +
               'redeems at the seat server address the pass names.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.code === 'producer_requires_signing') {
@@ -2787,11 +2832,11 @@ scopeFailure('endpoint'),
                 'This endpoint has no inbound signing configured, so a seat could not be attributed. ' +
                 'Enable signing first with set_endpoint_signing, then mint the seat.',
             },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'minting a seat');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2812,11 +2857,11 @@ scopeFailure('endpoint'),
       annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ endpointId, handle, checkedInOnly }) => {
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       try {
         if (!endpointId) {
           const scope = await resolveDefaultScope(ctx);
-          if (!scope) return fail(scopeFailure('endpoint'), authMeta(plan, {}, ctx.metaOverride));
+          if (!scope) return fail(scopeFailure(ctx, 'endpoint'), authMeta(ctx, plan));
           endpointId = scope.endpointId;
         }
         const answer = await ctx.client.post(
@@ -2835,11 +2880,11 @@ scopeFailure('endpoint'),
               : 'The slot is authorized. When the handle asks and its human accepts the consent email, ' +
                 'the promotion completes on its own.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'authorizing standing');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2864,8 +2909,8 @@ scopeFailure('endpoint'),
           const scope = await resolveDefaultScope(ctx);
           if (!scope) {
             return fail(
-              scopeFailure('endpoint'),
-              authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+              scopeFailure(ctx, 'endpoint'),
+              authMeta(ctx, await anyCachedPlan(ctx)),
             );
           }
           endpointId = scope.endpointId;
@@ -2880,13 +2925,14 @@ scopeFailure('endpoint'),
             invites: opaqueIds(invites),
             hint:
               'members = accepted collaborators (revoke with revoke_member using the membership id; this also ' +
-              'revokes their scoped tokens). invites = every minted invite with its status; revoke a pending ' +
-              'one with revoke_invite before it is accepted.',
+              'revokes their scoped tokens). invites = every minted invite with its status; revoke_invite ' +
+              'kills a pending one and also unseats a redeemed seat invite (Tier seat, Status accepted) - ' +
+              'seats live on this rail, not in members.',
           },
-          authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx)),
         );
       } catch (err) {
-        return mapAuthError(err, await anyCachedPlan(), ctx.metaOverride);
+        return mapAuthError(ctx, err, await anyCachedPlan(ctx));
       }
     },
   );
@@ -2895,10 +2941,11 @@ scopeFailure('endpoint'),
     'revoke_invite',
     {
       description:
-        'Revoke a pending invite on an endpoint you own, so its link stops working and the landing answers ' +
-        'not-found. Nothing about existing members changes. Inputs: inviteId from list_members, and ' +
-        'endpointId. Use it when an invite was shared too widely or minted by mistake. Confirm with your ' +
-        'user first: this cannot be undone, and changing their mind takes a fresh create_invite.',
+        'Revoke an invite on an endpoint you own: a pending invite\'s link stops working, and a redeemed ' +
+        'SEAT invite is unseated on the spot - posting and reading stop, the log keeps its bylines, no ' +
+        'web login needed. Person-memberships are revoke_member\'s job. Inputs: inviteId from ' +
+        'list_members, and endpointId. Confirm with your user first: this cannot be undone; changing ' +
+        'their mind takes a fresh create_invite or mint_seat.',
       inputSchema: {
         endpointId: id,
         inviteId: z.string().describe('Opaque invite id from list_members.'),
@@ -2906,7 +2953,7 @@ scopeFailure('endpoint'),
       annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ endpointId, inviteId }) => {
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       try {
         const result = await ctx.client.delete(`/api/v1/endpoints/${endpointId}/invites/${inviteId}`);
         return ok(
@@ -2915,11 +2962,11 @@ scopeFailure('endpoint'),
             revokedBy: 'this session\'s account',
             hint: 'The invite link is dead. The endpoint\'s Members panel and list_members reflect it immediately.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'revoking an invite');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2939,7 +2986,7 @@ scopeFailure('endpoint'),
       annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ endpointId, membershipId }) => {
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       try {
         const result = await ctx.client.delete(`/api/v1/endpoints/${endpointId}/memberships/${membershipId}`);
         return ok(
@@ -2950,11 +2997,11 @@ scopeFailure('endpoint'),
               'Membership and its scoped tokens are revoked; the participant\'s reads now answer not-found. ' +
               'Their past signed captures keep their attribution. Re-inviting takes a fresh create_invite.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'revoking a membership');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -2989,7 +3036,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3016,12 +3063,12 @@ scopeFailure('endpoint'),
                 ? 'Target is ARMED (autoReplay on): captures fan out to it automatically. Bind a transformation to it (bind_transformation) to deliver transformed payloads.'
                 : 'Target created DISARMED (autoReplay off): standing bindings will NOT deliver through it until you arm it with update_replay_target { autoReplay: true }. Manual replay_to_target still works.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'creating replay targets');
         if (isLimitError(err)) return failLimit(err, plan, projectId, { endpointId });
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3052,7 +3099,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3076,12 +3123,12 @@ scopeFailure('endpoint'),
               ? 'Target is ARMED: standing bindings and capture fan-out now deliver through it.'
               : 'Target is DISARMED: no automatic delivery. Manual replay_to_target still works.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'updating replay targets');
         if (isLimitError(err)) return failLimit(err, plan, projectId, { endpointId, targetId });
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3116,7 +3163,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3148,11 +3195,11 @@ scopeFailure('endpoint'),
                 'that. Do not invent a header the recipe does not declare. If this pipe genuinely needs a ' +
                 'header credential, use "$secrets.NAME" in the value and call request_secret_setup.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'setting target headers');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3185,7 +3232,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3200,11 +3247,27 @@ scopeFailure('endpoint'),
           { Key: key, SigningHeader: signingHeader, SignatureScheme: 'simple' },
         )) as { Rotated?: boolean };
         // Persist locally only after the server accepted — the pair can't drift.
-        putCredential(signingKeyRef(endpointId), {
-          type: 'signing',
-          value: key,
-          createdAt: new Date().toISOString(),
-        });
+        try {
+          putCredential(signingKeyRef(endpointId), {
+            type: 'signing',
+            value: key,
+            createdAt: new Date().toISOString(),
+          });
+        } catch (persistErr) {
+          // Round 3: the server ALREADY accepted the rotation - a generic error here
+          // would hide that every existing signer just broke while the only copy of
+          // the new key was lost. Name the state and the recovery exactly.
+          return fail(
+            {
+              code: 'key_persist_failed',
+              message:
+                `The server accepted the signing change - the endpoint now requires the NEW key - but it could ` +
+                `not be stored locally (${(persistErr as Error).message}) so this machine does not hold it. ` +
+                'Run set_endpoint_signing again once ~/.flurryport is writable: another rotation stores a fresh pair.',
+            },
+            authMeta(ctx, plan),
+          );
+        }
         return ok(
           {
             endpointId,
@@ -3218,11 +3281,11 @@ scopeFailure('endpoint'),
                 : 'Signing is live. ') +
               'Unsigned posts to this endpoint bounce 401. Use post_intent to send signed events; the key stays in the local keystore.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'configuring signing');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3273,7 +3336,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3302,11 +3365,11 @@ scopeFailure('endpoint'),
               : 'Recorded. get_endpoint carries it under recipeInstalls, so the next agent on this ' +
                 'endpoint reads which version is pinned instead of guessing from the wiring.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'recording a recipe install');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3351,7 +3414,7 @@ scopeFailure('endpoint'),
       if (captureId && clear) {
         return fail(
           { code: 'validation', message: 'captureId and clear: true are mutually exclusive - pass one or the other.' },
-          authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx)),
         );
       }
       // #363: the orientation lock and the room state are separately settable. A call
@@ -3365,7 +3428,7 @@ scopeFailure('endpoint'),
               'Nothing to set. Pass captureId (to orient on a capture), clear: true (to release the ' +
               'orientation), or sections / roster (to set the room state).',
           },
-          authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+          authMeta(ctx, await anyCachedPlan(ctx)),
         );
       }
       if (!projectId || !endpointId) {
@@ -3373,7 +3436,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3387,7 +3450,7 @@ scopeFailure('endpoint'),
         } catch {
           return fail(
             { code: 'validation', message: 'captureId is not a valid id. Pass it verbatim from list_captures.' },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
       }
@@ -3411,11 +3474,11 @@ scopeFailure('endpoint'),
                 ? `Orientation set. ${released}Seats read OrientationCaptureId from get_endpoint, then get_capture for the content.`
                 : `Orientation released. ${released}The room has no orientation until set_orientation is called again.`,
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         if (err instanceof AuthApiError && err.status === 403) return failReadOnly(plan, 'setting the orientation');
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3445,7 +3508,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3454,9 +3517,9 @@ scopeFailure('endpoint'),
       const plan = await getPlan(ctx, projectId);
       try {
         const result = await ctx.client.get(`/api/v1/projects/${projectId}/endpoints/${endpointId}/sections`);
-        return ok(opaqueIds(result), authMeta(plan, {}, ctx.metaOverride));
+        return ok(opaqueIds(result), authMeta(ctx, plan));
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3485,7 +3548,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3494,9 +3557,9 @@ scopeFailure('endpoint'),
       const plan = await getPlan(ctx, projectId);
       try {
         const result = await ctx.client.get(`/api/v1/projects/${projectId}/endpoints/${endpointId}/canon`);
-        return ok(opaqueIds(result), authMeta(plan, {}, ctx.metaOverride));
+        return ok(opaqueIds(result), authMeta(ctx, plan));
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3535,7 +3598,7 @@ scopeFailure('endpoint'),
         if (!scope) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointId from list_projects / list_endpoints.' },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
         projectId = projectId ?? scope.projectId;
@@ -3550,11 +3613,22 @@ scopeFailure('endpoint'),
       // the key through the ctx seam instead: the seat key lives in session memory,
       // never in the operator's disk keystore.
       const seatKey = ctx.intentKey?.() ?? null;
-      const chosen = ctx.intentKey
-        ? (seatKey
-            ? { keyRef: seatKey.keyRef ?? 'seat-key', credential: { type: 'signing', value: seatKey.key, createdAt: '' } }
-            : null)
-        : chooseIntentKey(endpointId);
+      let chosen: ReturnType<typeof chooseIntentKey>;
+      try {
+        chosen = ctx.intentKey
+          ? (seatKey
+              ? { keyRef: seatKey.keyRef ?? 'seat-key', credential: { type: 'signing', value: seatKey.key, createdAt: '' } }
+              : null)
+          : chooseIntentKey(endpointId);
+      } catch (err) {
+        // Round 3: this read ran BEFORE the try below, so a locked keystore's raw
+        // ErrnoException (absolute path, username) escaped to the SDK and reached
+        // the remote client verbatim. The typed error's message is clean.
+        return fail(
+          { code: 'keystore_unavailable', message: `${(err as Error).message} Try the call again shortly.` },
+          authMeta(ctx, plan),
+        );
+      }
       const usedKeyRef = chosen?.keyRef ?? null;
       const credential = chosen?.credential ?? null;
 
@@ -3569,7 +3643,7 @@ scopeFailure('endpoint'),
           `/api/v1/projects/${projectId}/endpoints/${endpointId}`,
         )) as { Slug?: string; SigningHeader?: string | null; SigningEnabled?: boolean | null };
         if (!endpoint.Slug) {
-          return fail({ code: 'not_found', message: 'Endpoint not found.' }, authMeta(plan, {}, ctx.metaOverride));
+          return fail({ code: 'not_found', message: 'Endpoint not found.' }, authMeta(ctx, plan));
         }
 
         if (!credential || !usedKeyRef) {
@@ -3585,7 +3659,7 @@ scopeFailure('endpoint'),
                   'set_endpoint_signing. If you were invited as a producer, run "flurryport join <token>" ' +
                   'to accept the invite and store the contributor key - both without exposing the value here.',
               },
-              authMeta(plan, {}, ctx.metaOverride),
+              authMeta(ctx, plan),
             );
           }
 
@@ -3601,7 +3675,7 @@ scopeFailure('endpoint'),
           if (!delivery.ok) {
             return fail(
               { code: `http_${delivery.httpStatus}`, message: delivery.errorText || `Capture URL answered ${delivery.httpStatus}.` },
-              authMeta(plan, {}, ctx.metaOverride),
+              authMeta(ctx, plan),
             );
           }
 
@@ -3636,7 +3710,7 @@ scopeFailure('endpoint'),
                   'stream should be signed, the owner runs set_endpoint_signing - after which unsigned ' +
                   'posts like this one bounce 401.',
             },
-            authMeta(await freshPlanAfterCapture(ctx, projectId), {}, ctx.metaOverride),
+            authMeta(ctx, await freshPlanAfterCapture(ctx, projectId)),
           );
         }
 
@@ -3660,13 +3734,13 @@ scopeFailure('endpoint'),
                 'The endpoint rejected the signature (401). The local key no longer matches the server - ' +
                 'run set_endpoint_signing again to rotate the pair back into sync.',
             },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
         if (!delivery.ok) {
           return fail(
             { code: `http_${delivery.httpStatus}`, message: delivery.errorText || `Capture URL answered ${delivery.httpStatus}.` },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
 
@@ -3699,10 +3773,10 @@ scopeFailure('endpoint'),
                 : 'The intent was captured and signature-verified. Standing bindings on this endpoint now ' +
                   'transform and deliver it; check outcomes with list_replay_executions or get_capture_digest.',
           },
-          authMeta(await freshPlanAfterCapture(ctx, projectId), {}, ctx.metaOverride),
+          authMeta(ctx, await freshPlanAfterCapture(ctx, projectId)),
         );
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3760,7 +3834,7 @@ scopeFailure('endpoint'),
                   : 'More than one joined room. Pass projectId and endpointId from the join receipt of ' +
                     'the room you are asking in.',
             },
-            authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+            authMeta(ctx, await anyCachedPlan(ctx)),
           );
         }
       }
@@ -3778,7 +3852,7 @@ scopeFailure('endpoint'),
               `request_seat is the monitor rail's one verb, and this credential is ${who}. ` +
               `Say it in the room with ${verb} instead - you can already post here.`,
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       if (ctx.intentKey) return notAMonitor('a seat at the table', 'post');
       // Deliberately the endpoint-only path form: the router falls back to a PROJECT
@@ -3791,7 +3865,15 @@ scopeFailure('endpoint'),
           'the signed-in account, not a joined grant',
           'post_intent (or mint_seat, if you are the host handing one out)');
       }
-      if (chooseIntentKey(endpointId)) return notAMonitor('a producer holding a contributor key', 'post_intent');
+      try {
+        if (chooseIntentKey(endpointId)) return notAMonitor('a producer holding a contributor key', 'post_intent');
+      } catch (err) {
+        // Round 3: same pre-try keystore read - surface the clean message, never the raw path.
+        return fail(
+          { code: 'keystore_unavailable', message: `${(err as Error).message} Try the call again shortly.` },
+          authMeta(ctx, await anyCachedPlan(ctx)),
+        );
+      }
 
       try {
         const endpoint = (await ctx.client.get(path)) as {
@@ -3800,7 +3882,7 @@ scopeFailure('endpoint'),
           Roster?: Array<{ Handle?: string; Role?: string }> | null;
         };
         if (!endpoint.Slug) {
-          return fail({ code: 'not_found', message: 'Endpoint not found.' }, authMeta(plan, {}, ctx.metaOverride));
+          return fail({ code: 'not_found', message: 'Endpoint not found.' }, authMeta(ctx, plan));
         }
 
         // Fail closed exactly like post_intent: undefined means an older server, and
@@ -3816,7 +3898,7 @@ scopeFailure('endpoint'),
                 'to the host directly; the host mints a pairing code with mint_seat and hands it back, ' +
                 'and redeeming it gives you a seat that can post signed.',
             },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
 
@@ -3847,13 +3929,13 @@ scopeFailure('endpoint'),
                 'The room is rate limiting posts right now, so the ask did not land. Wait and call ' +
                 'request_seat once more; do not loop on it.',
             },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
         if (!delivery.ok) {
           return fail(
             { code: `http_${delivery.httpStatus}`, message: delivery.errorText || `Capture URL answered ${delivery.httpStatus}.` },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
 
@@ -3875,10 +3957,10 @@ scopeFailure('endpoint'),
               'agrees mints a pairing code and gets it to you, and you redeem it for a seat that posts. ' +
               'Nothing here grants a seat by itself, and asking twice does not make one arrive sooner.',
           },
-          authMeta(await freshPlanAfterCapture(ctx, projectId), {}, ctx.metaOverride),
+          authMeta(ctx, await freshPlanAfterCapture(ctx, projectId)),
         );
       } catch (err) {
-        return mapAuthError(err, plan, ctx.metaOverride);
+        return mapAuthError(ctx, err, plan);
       }
     },
   );
@@ -3911,7 +3993,7 @@ scopeFailure('endpoint'),
             ? 'No pipes recorded yet. After wiring one (create_endpoint -> create_transformation -> bind_transformation -> set_endpoint_signing), record it with write_pipe_manifest so it travels with the repo.'
             : 'Verify against server state before firing: ids in the manifest may lag reality (server wins).',
         },
-        authMeta(await anyCachedPlan(), {}, ctx.metaOverride),
+        authMeta(ctx, await anyCachedPlan(ctx)),
       );
     },
   );
@@ -3941,13 +4023,13 @@ scopeFailure('endpoint'),
       annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ name, remove, projectId, endpointSlug, recipe, transformationId, intentSchema, signingKeyRef, signingHeader, draft }) => {
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       try {
         if (remove) {
           const manifest = removeManifestEntry(name);
           return ok(
             { path: manifestPath(), removed: name, pipes: manifest.pipes.map((p) => p.name) },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
         if (!projectId || !endpointSlug) {
@@ -3958,7 +4040,7 @@ scopeFailure('endpoint'),
         if (!projectId || !endpointSlug) {
           return fail(
             { code: 'ambiguous_scope', message: 'Pass projectId and endpointSlug (from list_projects / list_endpoints).' },
-            authMeta(plan, {}, ctx.metaOverride),
+            authMeta(ctx, plan),
           );
         }
         const entry = {
@@ -3985,10 +4067,10 @@ scopeFailure('endpoint'),
             pipes: manifest.pipes.map((p) => p.name),
             hint: 'Safe to commit: the manifest carries refs, never key material. A teammate\'s agent can read it and offer to connect with their own token.',
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
-        return fail({ code: 'manifest_rejected', message: (err as Error).message }, authMeta(plan, {}, ctx.metaOverride));
+        return fail({ code: 'manifest_rejected', message: (err as Error).message }, authMeta(ctx, plan));
       }
     },
   );
@@ -4008,7 +4090,7 @@ scopeFailure('endpoint'),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async () => {
-      const plan = await anyCachedPlan();
+      const plan = await anyCachedPlan(ctx);
       try {
         const catalog = await fetchPlanCatalog(resolveBillingBaseUrl(ctx.client.baseUrl));
         return ok(
@@ -4023,12 +4105,12 @@ scopeFailure('endpoint'),
               plan?.PlanTierId != null ? String(plan.PlanTierId) : 'billing',
             ),
           },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       } catch (err) {
         return fail(
           { code: 'unavailable', message: `Plan catalog is unreachable right now: ${(err as Error).message}` },
-          authMeta(plan, {}, ctx.metaOverride),
+          authMeta(ctx, plan),
         );
       }
     },
@@ -4036,8 +4118,8 @@ scopeFailure('endpoint'),
 }
 
 /** Best-effort plan for meta on project-less calls: any cached plan (single-project accounts dominate). */
-async function anyCachedPlan(): Promise<ProjectPlanInfo | null> {
-  const first = planCache.values().next();
+function anyCachedPlan(ctx: AuthToolContext): ProjectPlanInfo | null {
+  const first = ctx.session.planCache.values().next();
   return first.done ? null : first.value.plan;
 }
 

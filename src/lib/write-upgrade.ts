@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { AuthApiError, type AuthApiClient } from './auth-api.js';
+import { BoundedDelivery } from './one-shot-delivery.js';
 
 /**
  * Client half of the in-flow write grant (ratified 2026-07-20): once authenticated
@@ -24,6 +25,14 @@ export class WriteUpgradeController {
   private done = false;
   private alreadyWrite = false;
   private startedAt = 0;
+  /**
+   * A granted token whose onGranted callback has not succeeded yet (hardening
+   * precedent #7): the release is one-shot, so it is held in memory and the
+   * callback retried each tick rather than discarded on a persist throw.
+   */
+  private pendingGrant: string | null = null;
+  /** In-flight latch + bounded retry for delivery (shared protocol, round 3). */
+  private readonly delivery = new BoundedDelivery();
 
   constructor(
     private readonly getClient: () => AuthApiClient,
@@ -51,6 +60,15 @@ export class WriteUpgradeController {
 
   private async tick(): Promise<void> {
     if (this.done) return;
+    // A delivery in flight, or a one-shot grant collected but not yet delivered:
+    // never re-poll a release the server will not repeat. The concurrency guard
+    // itself lives INSIDE deliverGrant (round 3: a tick-entry-only latch missed
+    // already-in-flight poll responses).
+    if (this.delivery.inFlight) return;
+    if (this.pendingGrant) {
+      await this.deliverGrant(this.pendingGrant);
+      return;
+    }
     if (Date.now() - this.startedAt > this.maxWaitMs) {
       // Nothing decided in hours — stand down. registered stays false so a later
       // ensureStarted arms a fresh wait against the (re-registerable) hand-off.
@@ -79,9 +97,8 @@ export class WriteUpgradeController {
         Token?: string | null;
       };
       if (res.Status === 'complete' && res.Token) {
-        this.done = true;
-        this.stop();
-        await this.onGranted(res.Token);
+        this.pendingGrant = res.Token;
+        await this.deliverGrant(res.Token);
       } else if (res.Status === 'skipped') {
         this.done = true;
         this.stop();
@@ -90,6 +107,28 @@ export class WriteUpgradeController {
     } catch (err) {
       // 404 = the hand-off lapsed (30-min TTL) — re-register on the next tick.
       if (err instanceof AuthApiError && err.status === 404) this.registered = false;
+    }
+  }
+
+  /**
+   * Complete the grant through the shared bounded-delivery protocol
+   * (one-shot-delivery.ts): done/stop only after onGranted succeeds; failures
+   * retry from memory under a cap; a second in-flight poll's response is
+   * skipped, never a concurrent second invocation of the callback.
+   */
+  private async deliverGrant(token: string): Promise<void> {
+    if (this.done) return;
+    const outcome = await this.delivery.run(() => this.onGranted(token), {
+      retry: (reason) => `Write grant collected but activating it failed (${reason}); retrying.`,
+      giveUp: (reason) =>
+        `Write grant collected but activating it kept failing (${reason}). ` +
+        'Giving up: check that ~/.flurryport is writable, then generate a read-write token in Settings and ' +
+        'install it with `flurryport login <token>`.',
+    });
+    if (outcome === 'done' || outcome === 'gave_up') {
+      this.pendingGrant = null;
+      this.done = true;
+      this.stop();
     }
   }
 }

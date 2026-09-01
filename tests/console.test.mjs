@@ -296,24 +296,33 @@ test(':seat mints from the chair and displays the code with the ferry warning', 
   assert.ok(roster[0].rows.some((r) => r.handle === 'the-quiet-scribe'));
 });
 
-test('the boarding pass is the SLIM paste-ready payload: identity and reachability only (ratified 2026-08-17)', async () => {
+test('the boarding pass is the SLIM paste-ready payload with the human preamble on top (ratified 2026-08-17, amended 2026-08-31)', async () => {
   putChairIdentity(CHAIR_FROM);
   const { engine } = await boundEngine();
   const events = await engine.execute(':seat The Quiet Scribe');
   assert.equal(events[0].type, 'pairing');
   const lines = events[0].passLines;
   const pass = lines.join('\n');
-  // The ratified layout: open sentence, blank line, three bullets, blank line,
-  // the handle line, blank line, the redeem line.
-  assert.match(lines[0], /^You have a seat at a FlurryPORT room/);
-  assert.equal(lines[1], '');
-  assert.match(lines[2], /^- Your pairing code is 7WHM-KR4P-XT2B\. Single use/);
-  assert.match(lines[3], /^- Seat server: .*flurryport seat-server|^- Seat server: http/);
-  assert.match(lines[4], /^- Before redeeming, GET .*whoami/);
+  // The amended layout (pass-copy sitting): three preamble sentences for the
+  // human recipient, blank line, then the slim agent body exactly as before.
+  // The console mints with no sender name, so the neutral fallback opens.
+  assert.match(lines[0], /^The person who sent you this saved a place for your AI assistant/);
+  assert.match(lines[1], /^You don't need to sign up, install anything, or open anything in a browser/);
+  assert.match(lines[2], /^Paste the whole message into a chat with your AI assistant/);
+  assert.equal(lines[3], '');
+  assert.match(lines[4], /^You have a seat at a FlurryPORT room/);
   assert.equal(lines[5], '');
+  assert.match(lines[6], /^- Your pairing code is 7WHM-KR4P-XT2B\. Single use/);
+  assert.match(lines[7], /^- Seat server: .*flurryport seat-server|^- Seat server: http/);
+  assert.match(lines[8], /^- Optional check before redeeming: GET .*whoami/);
+  assert.equal(lines[9], '');
   assert.match(pass, /Your handle is the-quiet-scribe\. The chair is director\./);
   assert.match(pass, /redeem_seat_code/); // the redeem line still names the tool
   assert.match(pass, /instructions block; it carries the wire schema and the room ceremony/);
+  // Newcomer exits (pass-copy sitting): no tool, cannot fetch, anything fails.
+  assert.match(pass, /tell your human that plainly and stop/);
+  assert.match(pass, /Skip this check if you cannot fetch URLs/);
+  assert.match(pass, /tell your human exactly what failed and stop/);
   // #412: the stay-or-go rule is structural on every pass, standing by default.
   assert.match(pass, /Seat lifecycle: standing\./);
   assert.match(pass, /STAY seated; keep your MCP session and you keep the seat/);
@@ -1381,8 +1390,11 @@ test('the boarding pass teaches the /whoami preflight before the code is spent',
   const events = await engine.execute(':seat Bunny Guest');
   const pass = events.find((e) => e.type === 'pairing').passLines.join('\n');
   assert.match(pass, /GET http:\/\/127\.0\.0\.1:9999\/whoami/, 'the whoami URL derives from the room URL');
-  assert.match(pass, /it answers without a session and spends nothing/);
-  assert.match(pass, /ask your human/);
+  assert.match(pass, /answers without a session and spends nothing/);
+  // The pass-copy sitting made the preflight optional with an exit, and gave
+  // every failure a no-improvise path back to the human.
+  assert.match(pass, /Skip this check if you cannot fetch URLs/);
+  assert.match(pass, /tell your human/);
 
   // The standalone pass (no hosted room URL) keeps the generic form of the lesson.
   const bare = new ConsoleEngine(fakeRoom().api);

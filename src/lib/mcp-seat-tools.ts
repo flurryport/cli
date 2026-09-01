@@ -5,9 +5,10 @@ import { handleBase } from './console-handles.js';
 import { attentionNotice, minutesUntil, type MetaNotice, type SeatMetaEnvelope } from './mcp-meta.js';
 import type { AttentionRelay } from './attention-relay.js';
 import type { PresenceLedger } from './presence.js';
+import { sanitizeOutboundError } from './fetch-error.js';
 import { fail, ok } from './mcp-response.js';
 import { collectTools } from './mcp-unified.js';
-import { bytesRemaining, registerAuthTools, type AuthToolContext } from './mcp-auth-tools.js';
+import { bytesRemaining, createAuthSessionState, registerAuthTools, type AuthToolContext } from './mcp-auth-tools.js';
 import { opaqueIds } from './auth-api.js';
 import { seatServerInstructions } from './mcp-server-instructions.js';
 import { randomBytes } from 'node:crypto';
@@ -573,6 +574,7 @@ export function registerSeatTools(
   const seatCtx: AuthToolContext = {
     client: preSeatStub(opts.apiBase),
     allowLan: false,
+    session: createAuthSessionState(),
     quota: 'none',
     // #358: the hosted rooms service posts in-cluster; it marks its posts and names
     // the public host so Core stores the capture with no internal address in it.
@@ -1015,7 +1017,7 @@ export function registerSeatTools(
         if (err instanceof AuthApiError) {
           return fail({ code: err.code, message: err.detail || err.message }, meta);
         }
-        return fail({ code: 'error', message: err instanceof Error ? err.message : String(err) }, meta);
+        return fail(sanitizeOutboundError(err), meta);
       }
     },
   );
@@ -1135,6 +1137,7 @@ export function registerSeatTools(
         orientationCaptureId: briefing.orientationCaptureId,
         orientation: briefing.orientation,
         canon: briefing.canon,
+        ...(briefing.briefingNote ? { briefingNote: briefing.briefingNote } : {}),
         custody: checkedIn
           ? 'Checked-in custody: you hold nothing. On session loss, call attach_standing with your ' +
             `handle and this room's endpointId; your steward approves each new session. Standing ends ${toUtcIso(release.expiresAt)}. ` +
@@ -1185,19 +1188,23 @@ export function registerSeatTools(
               buildSeatMeta(null),
             );
           } catch (err) {
-            pendingRelease = null;
-            if (err instanceof SeatRedeemError && err.status === 404) {
-              return fail(
-                {
-                  code: 'release_closed',
-                  message:
-                    'The approval window closed: denied, expired, or already used. Call attach_standing ' +
-                    'with handle + endpointId to ask again.',
-                },
-                buildSeatMeta(null),
-              );
+            // Only a 404 is terminal (denied, expired, or already used). A throttle,
+            // server error, or dropped connection must NOT abort the ceremony: the
+            // steward may already hold the relayed approval URL, and re-arming would
+            // orphan their approval. Keep the pending release and let the agent poll again.
+            if (!(err instanceof SeatRedeemError && err.status === 404)) {
+              return mapRedeemError(err, null);
             }
-            return mapRedeemError(err, null);
+            pendingRelease = null;
+            return fail(
+              {
+                code: 'release_closed',
+                message:
+                  'The approval window closed: denied, expired, or already used. Call attach_standing ' +
+                  'with handle + endpointId to ask again.',
+              },
+              buildSeatMeta(null),
+            );
           }
         }
         if (handle && endpointId) {
@@ -1336,32 +1343,52 @@ async function loadBriefing(
   let orientationCaptureId: string | null = null;
   let orientation: string | null = null;
   let canon: unknown = null;
+  // Precedent #9: a 500/timeout/pod-restart must NOT read as "this room published
+  // no orientation" - that fabricated receipt is exactly what the #343 orientation
+  // lock exists to prevent. Only a 404 means the feature is absent (older server);
+  // any other failure is named so the seat knows to re-read, not to post freely.
+  const unavailable: string[] = [];
+  const isAbsent = (err: unknown) => err instanceof AuthApiError && err.status === 404;
 
   try {
     const sections = opaqueIds(await principal.client.get(`${base}/sections`)) as { OrientationCaptureId?: string | null };
     orientationCaptureId = sections.OrientationCaptureId ?? null;
-  } catch {
-    /* an older server has no sections read; the seat is seated all the same */
+  } catch (err) {
+    if (!isAbsent(err)) unavailable.push('the room map (sections)');
+    /* 404: an older server has no sections read; the seat is seated all the same */
   }
 
   if (orientationCaptureId) {
     try {
       const tool = registry.get('get_capture');
       const result = (await tool?.handler({ captureId: orientationCaptureId })) as ToolResult | undefined;
-      const payload = JSON.parse(result?.content?.[0]?.text ?? 'null') as { body?: unknown } | null;
+      const payload = JSON.parse(result?.content?.[0]?.text ?? 'null') as
+        | { body?: unknown; error?: { code?: string } }
+        | null;
       if (payload && typeof payload.body === 'string') orientation = payload.body;
+      else if (payload?.error && payload.error.code !== 'not_found') unavailable.push('the orientation text');
+      /* not_found: the lock may point at a capture that aged out; the id still stands */
     } catch {
-      /* the lock may point at a capture that aged out; the id still stands */
+      unavailable.push('the orientation text');
     }
   }
 
   try {
     canon = opaqueIds(await principal.client.get(`${base}/canon`));
-  } catch {
-    /* an older server has no canon read */
+  } catch (err) {
+    if (!isAbsent(err)) unavailable.push('the canon');
+    /* 404: an older server has no canon read */
   }
 
-  return { orientationCaptureId, orientation, canon, briefingNote: null };
+  return {
+    orientationCaptureId,
+    orientation,
+    canon,
+    briefingNote: unavailable.length
+      ? `Could not read ${unavailable.join(' or ')} right now (server error, not an empty room). ` +
+        'Re-read with list_sections / get_capture / get_canon before treating this room as unoriented.'
+      : null,
+  };
 }
 
 /** Legible redemption failures: server detail passes through, next move named. */
@@ -1416,7 +1443,8 @@ function mapRedeemError(err: unknown, principal: SeatPrincipal | null) {
     }
     return fail({ code: err.code, message: err.detail || err.message }, meta);
   }
-  return fail({ code: 'error', message: err instanceof Error ? err.message : String(err) }, meta);
+  // Precedent #8: an unknown error's raw message can name internal cluster hosts.
+  return fail(sanitizeOutboundError(err), meta);
 }
 
 /** One MCP session's seat server: fresh principal state per call (mcp-http's contract). */

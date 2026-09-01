@@ -64,6 +64,14 @@ const pending = new Map<string, {
   lastLandingCheckAt: number;
   /** Set when the landing first showed accepted-but-uncollected: the accept-race grace clock. */
   acceptedSeenAt?: number;
+  /**
+   * A release already collected from the server but not yet fully persisted
+   * (round 3): the release is ONE-SHOT - a keystore lock during putCredential
+   * must not lose the contributor key forever. Held in memory; the next
+   * join_invite call retries the persist from here instead of re-polling a
+   * channel the server already closed.
+   */
+  collected?: PollDeviceHandoffResponse;
 }>();
 
 /** How often a pending poll may double-check the landing's honest signals. (Env knob is for tests.) */
@@ -210,7 +218,12 @@ export function registerInviteTools(server: McpServer, ctx: InviteToolContext): 
       }
 
       // Later calls: poll once. Pending is the normal answer before the human clicks.
+      // A release already collected but not persisted (round 3) skips the poll and
+      // retries the persist from memory - the server will not repeat the release.
       let release: PollDeviceHandoffResponse;
+      if (entry.collected) {
+        release = entry.collected;
+      } else {
       try {
         release = await client.pollInviteDevice(entry.deviceCode);
       } catch (err) {
@@ -298,18 +311,31 @@ export function registerInviteTools(server: McpServer, ctx: InviteToolContext): 
           });
         }
       }
+      }
 
-      // Released. The key stops here: keystore, never the response.
-      pending.delete(token);
+      // Released. The key stops here: keystore, never the response. The pending
+      // entry survives (holding the release) until BOTH persists succeed - the
+      // release is one-shot and must never be lost to a transient keystore lock.
+      entry.collected = release;
       let signingConfigured = false;
       if (release.SigningKey && release.ContributorEndpointId) {
-        putCredential(contributorKeyRef(release.ContributorEndpointId), {
-          type: 'contributor',
-          value: release.SigningKey,
-          createdAt: new Date().toISOString(),
-        });
+        try {
+          putCredential(contributorKeyRef(release.ContributorEndpointId), {
+            type: 'contributor',
+            value: release.SigningKey,
+            createdAt: new Date().toISOString(),
+          });
+        } catch (persistErr) {
+          return fail(
+            'credential_store_failed',
+            `The grant was collected but the contributor key could not be stored (${(persistErr as Error).message}). ` +
+            'Nothing is lost: the grant is held in memory for this session. Call join_invite again with the ' +
+            'same invite to retry storing it.',
+          );
+        }
         signingConfigured = true;
       }
+      pending.delete(token);
 
       const accountName = participantAccountName(release.ParticipantName);
       const sessionEffect = await ctx.onJoined(release, {

@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { parseErrorResponse } from './fetch-error.js';
 import { toUtcIso } from './time.js';
 
 /**
@@ -101,24 +102,8 @@ async function attemptRedeem(apiBase: string, code: string): Promise<SeatRelease
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    // Machine code out of ProblemDetails, the auth-api parse: "type" (non-http) wins,
-    // then a code-shaped "title"; otherwise the status maps to a generic code.
-    let redemptionCode =
-      res.status === 404 ? 'not_found'
-      : res.status === 429 ? 'throttled'
-      : res.status === 409 ? 'conflict'
-      : 'error';
-    let detail = text;
-    try {
-      const raw = JSON.parse(text) as Record<string, unknown>;
-      detail = (raw.detail as string) ?? (raw.Error as string) ?? (raw.title as string) ?? text;
-      if (typeof raw.type === 'string' && !raw.type.startsWith('http')) redemptionCode = raw.type;
-      else if (typeof raw.title === 'string' && /^[a-z_]+$/.test(raw.title)) redemptionCode = raw.title;
-    } catch {
-      /* not JSON */
-    }
-    throw new SeatRedeemError(res.status, redemptionCode, detail);
+    const { code, detail } = await parseErrorResponse(res);
+    throw new SeatRedeemError(res.status, code, detail);
   }
 
   const wire = (await res.json()) as RedeemSeatWire;
@@ -189,20 +174,7 @@ export async function exchangeStandingSession(apiBase: string, credential: strin
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    let code =
-      res.status === 404 ? 'not_found'
-      : res.status === 429 ? 'throttled'
-      : 'error';
-    let detail = text;
-    try {
-      const raw = JSON.parse(text) as Record<string, unknown>;
-      detail = (raw.detail as string) ?? (raw.title as string) ?? text;
-      if (typeof raw.type === 'string' && !raw.type.startsWith('http')) code = raw.type;
-      else if (typeof raw.title === 'string' && /^[a-z_]+$/.test(raw.title)) code = raw.title;
-    } catch {
-      /* not JSON */
-    }
+    const { code, detail } = await parseErrorResponse(res);
     throw new SeatRedeemError(res.status, code, detail);
   }
 
@@ -250,8 +222,11 @@ export async function startStandingRelease(
     body: JSON.stringify({ EndpointId: endpointId, Handle: handle, DeviceCode: deviceCode, ApprovalCode: approvalCode }),
   });
   if (!res.ok) {
-    const code = res.status === 404 ? 'not_found' : res.status === 429 ? 'throttled' : 'error';
-    throw new SeatRedeemError(res.status, code, await res.text().catch(() => ''));
+    // The shared parse carries the server's machine code (e.g. standing_not_found vs
+    // a throttle) so the re-attach caller can tell a dead grant from a transient
+    // failure instead of collapsing both to 'error'.
+    const { code, detail } = await parseErrorResponse(res);
+    throw new SeatRedeemError(res.status, code, detail);
   }
   const wire = (await res.json()) as StandingReleaseStartWire;
   return {
@@ -294,8 +269,8 @@ export async function pollStandingRelease(
     body: JSON.stringify({ DeviceCode: deviceCode }),
   });
   if (!res.ok) {
-    const code = res.status === 404 ? 'not_found' : res.status === 429 ? 'throttled' : 'error';
-    throw new SeatRedeemError(res.status, code, await res.text().catch(() => ''));
+    const { code, detail } = await parseErrorResponse(res);
+    throw new SeatRedeemError(res.status, code, detail);
   }
   const wire = (await res.json()) as StandingReleasePollWire;
   if (wire.Status !== 'complete') return { status: 'pending' };

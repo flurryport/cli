@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import type { AnonApiClient } from './anon-api.js';
+import { deleteStoreFile, readJsonStore, writeJsonStore } from './store.js';
 import { utcMs } from './time.js';
 
 /**
@@ -30,27 +30,20 @@ const SESSION_DIR = join(homedir(), '.flurryport');
 const SESSION_FILE = join(SESSION_DIR, 'anon-session.json');
 
 export function loadStoredSession(): StoredAnonSession | null {
-  if (!existsSync(SESSION_FILE)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(SESSION_FILE, 'utf-8')) as StoredAnonSession;
-    if (!parsed?.token || !parsed?.endpointSlug || !parsed?.expiresAt) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
+  // A locked/unreadable file degrades to no-session (a fresh mint) - the anon
+  // session is a resume convenience, not a secret store worth crashing over.
+  const parsed = readJsonStore<StoredAnonSession>(SESSION_FILE, { lenient: true });
+  if (!parsed?.token || !parsed?.endpointSlug || !parsed?.expiresAt) return null;
+  return parsed;
 }
 
+// The token is a capability: the shared store writes it 0600 and atomically.
 export function saveStoredSession(session: StoredAnonSession): void {
-  if (!existsSync(SESSION_DIR)) mkdirSync(SESSION_DIR, { recursive: true });
-  writeFileSync(SESSION_FILE, JSON.stringify(session, null, 2), 'utf-8');
+  writeJsonStore(SESSION_FILE, session);
 }
 
 export function clearStoredSession(): void {
-  try {
-    if (existsSync(SESSION_FILE)) unlinkSync(SESSION_FILE);
-  } catch {
-    /* best-effort */
-  }
+  deleteStoreFile(SESSION_FILE);
 }
 
 /** Funnel-attribution marker posted once per minted session (spec §9 #10). */

@@ -1,9 +1,9 @@
 import {
   AnonApiError,
-  appendFieldErrors,
   type PollDeviceHandoffResponse,
   type RegisterDeviceHandoffResponse,
 } from './anon-api.js';
+import { parseErrorResponse } from './fetch-error.js';
 import { recordCliNotice, versionHeader } from './version-nudge.js';
 
 /**
@@ -23,17 +23,7 @@ async function parse<T>(res: Response): Promise<T> {
   // Latch the server's version-staleness notice (if any) for the meta builders.
   recordCliNotice(res);
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    let code = res.status === 404 ? 'not_found' : res.status === 429 ? 'throttled' : 'error';
-    let detail = text;
-    try {
-      const raw = JSON.parse(text) as Record<string, unknown>;
-      detail = (raw.detail as string) ?? (raw.title as string) ?? text;
-      detail = appendFieldErrors(detail, raw.errors);
-      if (typeof raw.type === 'string' && !raw.type.startsWith('http')) code = raw.type;
-    } catch {
-      /* non-JSON body — keep the raw text as the detail */
-    }
+    const { code, detail } = await parseErrorResponse(res);
     throw new AnonApiError(res.status, code, detail);
   }
   return (await res.json()) as T;

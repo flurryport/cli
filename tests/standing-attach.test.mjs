@@ -245,6 +245,10 @@ function startCheckedInFakeApi() {
     approved: false,
     armedDeviceCode: null,
     released: false,
+    // Queue of one-shot poll failures: each entry is [status, body] answered
+    // (and consumed) before the normal poll logic runs. Lets a test prove a
+    // transient failure does not abort a pending ceremony.
+    pollFailures: [],
   };
   const releaseFields = (n) => ({
     SigningKey: `sig_ci_${n}`,
@@ -288,6 +292,10 @@ function startCheckedInFakeApi() {
         });
       }
       if (req.method === 'POST' && req.url === '/api/v1/anon/device/poll') {
+        if (state.pollFailures.length) {
+          const [failStatus, failBody] = state.pollFailures.shift();
+          return json(failStatus, failBody);
+        }
         const { DeviceCode } = JSON.parse(body);
         if (DeviceCode !== state.armedDeviceCode || state.released) return json(404, { type: 'not_found' });
         if (!state.approved) return json(200, { Status: 'pending', Token: null });
@@ -360,6 +368,107 @@ test('checked-in custody: keyless collect, steward-approved re-entry, no credent
     await third.init();
     const refused = await third.call('attach_standing', { handle: 'stranger', endpointId: 'ep222' });
     assert.equal(refused.error.code, 'standing_not_found');
+  } finally {
+    await host.shutdown();
+    api.server.close();
+  }
+});
+
+// Precedent #9 (hardening brief): a 500/timeout on the briefing reads must NOT read
+// as "this room published no orientation" - the fabricated-empty receipt #343's
+// orientation lock exists to prevent. Only a 404 means the feature is absent.
+test('a server error on the room reads yields briefingNote, not a fabricated empty room', async () => {
+  const makeApi = (sectionsStatus) => new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (d) => { body += d; });
+      req.on('end', () => {
+        const json = (code, payload) => {
+          res.writeHead(code, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(payload));
+        };
+        if (req.method === 'POST' && req.url === '/api/v1/invites/seats/redeem') {
+          return json(200, {
+            Token: 'fp_seat_b9', SigningKey: 'sig', SigningScheme: 'simple',
+            SigningHeader: 'X-Flurry-Signature', EndpointId: 'ep9', ProjectId: 'pr9',
+            EndpointSlug: 'locked-room', ParticipantName: 'probe', SeatRef: 'inv9',
+            ExpiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          });
+        }
+        if (req.url?.endsWith('/sections')) return json(sectionsStatus, { detail: 'boom' });
+        return json(404, { type: 'not_found' });
+      });
+    });
+    server.listen(0, '127.0.0.1', () => resolve({ server, base: `http://127.0.0.1:${server.address().port}` }));
+  });
+
+  for (const [status, expectNote] of [[500, true], [404, false]]) {
+    const api = await makeApi(status);
+    const host = await serveMcpHttp({
+      host: '127.0.0.1', port: 0, log: () => {},
+      build: async () => buildSeatServer({ apiBase: api.base, version: '0-test' }),
+    });
+    try {
+      const session = httpSession(host.url);
+      await session.init();
+      const seated = await session.call('redeem_seat_code', { code: '7WHM-KR4P-XT2B' });
+      assert.equal(seated.status, 'seated', 'a briefing failure never blocks the seat');
+      if (expectNote) {
+        assert.match(seated.briefingNote ?? '', /not an empty room/,
+          'a 500 on sections is named as unavailable');
+      } else {
+        assert.ok(!seated.briefingNote, 'a 404 is a legitimately absent feature - no note');
+      }
+    } finally {
+      await host.shutdown();
+      api.server.close();
+    }
+  }
+});
+
+// Precedent #6 regression (CLAUDE.20260829.cli-hardening-brief.md): a TRANSIENT poll
+// failure (throttle, server error) must not abort a pending steward approval - the
+// steward may already hold the relayed URL. Before the fix, ANY poll error cleared
+// the pending release, orphaning the approval; and the collapsed 'error' code hid
+// what actually happened. Only a 404 (denied/expired/used) closes the ceremony.
+test('checked-in poll: transient failures carry their code and keep the ceremony alive; 404 closes it', async () => {
+  const api = await startCheckedInFakeApi();
+  const host = await serveMcpHttp({
+    host: '127.0.0.1',
+    port: 0,
+    log: () => {},
+    build: async () => buildSeatServer({ apiBase: api.base, version: '0-test' }),
+  });
+  try {
+    const session = httpSession(host.url);
+    await session.init();
+    const armed = await session.call('attach_standing', { handle: 'engineering', endpointId: 'ep222' });
+    assert.equal(armed.status, 'approval_pending');
+
+    // A throttle and a server blip, each surfaced with a real code - not 'error',
+    // and NOT release_closed (the ceremony is still live).
+    api.state.pollFailures.push([429, { type: 'throttled', detail: 'Slow down.' }]);
+    const throttled = await session.call('attach_standing', {});
+    assert.equal(throttled.error.code, 'throttled', 'the machine code survives the parse');
+    api.state.pollFailures.push([500, { detail: 'boom' }]);
+    const blipped = await session.call('attach_standing', {});
+    assert.notEqual(blipped.error?.code, 'release_closed', 'a 500 must not read as a closed window');
+
+    // The pending release SURVIVED both failures: approval now releases the seat
+    // without re-arming (the same device code collects).
+    api.state.approved = true;
+    const reseated = await session.call('attach_standing', {});
+    assert.equal(reseated.status, 'standing', 'the ceremony survived the transient failures');
+    assert.equal(reseated.custodyMode, 'checked-in');
+
+    // And a real 404 after release IS terminal: a fresh session arms, then the
+    // already-consumed release answers 404 - window closed, re-arm taught.
+    const fresh = httpSession(host.url);
+    await fresh.init();
+    const gone = await fresh.call('attach_standing', { handle: 'engineering', endpointId: 'ep222' });
+    assert.equal(gone.status, 'approval_pending', 're-armed a fresh ceremony');
+    const closed = await fresh.call('attach_standing', {});
+    assert.equal(closed.error.code, 'release_closed', 'a 404 still closes the ceremony');
   } finally {
     await host.shutdown();
     api.server.close();

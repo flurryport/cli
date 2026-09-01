@@ -1,4 +1,5 @@
 import type { ResolvedContext } from './config.js';
+import { parseProblemDetails } from './fetch-error.js';
 import { recordCliNotice, versionHeader } from './version-nudge.js';
 
 export interface ApiClient {
@@ -12,6 +13,8 @@ export class ApiError extends Error {
     public readonly statusText: string,
     public readonly detail: string,
     public readonly raw: Record<string, unknown> | null,
+    /** Machine error code from the shared ProblemDetails parse (status-derived fallback otherwise). */
+    public readonly code: string = 'error',
   ) {
     super(detail || `${status} ${statusText}`);
     this.name = 'ApiError';
@@ -42,15 +45,13 @@ export function createApiClient(context: ResolvedContext): ApiClient {
       }
       const text = await res.text().catch(() => '');
       let raw: Record<string, unknown> | null = null;
-      let detail = text;
       try {
         raw = JSON.parse(text) as Record<string, unknown>;
-        // ASP.NET ProblemDetails uses "detail"; some endpoints return "Error" or "title"
-        detail = (raw.detail as string) ?? (raw.Error as string) ?? (raw.title as string) ?? text;
       } catch {
-        // not JSON — keep raw text as detail
+        // not JSON - the parser keeps the raw text as detail
       }
-      throw new ApiError(res.status, res.statusText, detail, raw);
+      const { code, detail } = parseProblemDetails(res.status, text);
+      throw new ApiError(res.status, res.statusText, detail, raw, code);
     }
     return res.json() as Promise<Record<string, unknown>>;
   };

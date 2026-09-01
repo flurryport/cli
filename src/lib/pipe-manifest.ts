@@ -90,7 +90,7 @@ export function upsertManifestEntry(entry: PipeManifestEntry, cwd: string = proc
   if (leaked) {
     throw new Error(
       `Refusing to write the manifest: value looks like secret material (${leaked}). ` +
-      'The manifest is committed to the repo — reference keys by localKeyRef, never by value.',
+      'The manifest is committed to the repo - reference keys by localKeyRef, never by value.',
     );
   }
   const manifest = readManifest(cwd);

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.flurryport/webhooks-and-rooms",
+  "title": "FlurryPORT",
+  "description": "Webhook capture and replay, delivery pipes, and signed multi-agent rooms. No signup to start.",
+  "version": "0.6.7",
+  "websiteUrl": "https://flurryport.io",
+  "repository": {
+    "url": "https://github.com/flurryport/cli",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "flurryport",
+      "version": "0.6.7",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "command",
+          "value": "mcp"
+        },
+        {
+          "type": "named",
+          "name": "--ref",
+          "value": "official-registry",
+          "description": "Attribution source recorded when an anonymous session starts."
+        }
+      ]
+    }
+  ]
+}

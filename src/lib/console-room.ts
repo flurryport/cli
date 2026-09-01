@@ -291,11 +291,23 @@ export function createRoomApi(client: AuthApiClient): RoomApi {
     },
 
     hasSigningKey(endpointId) {
-      return chooseIntentKey(endpointId) !== null;
+      // Round 3: a transiently locked keystore (already retried by the store) must
+      // degrade to "no key right now", never unwind the live console's readline
+      // loop - the #245 friendly-error catch only converts AuthApiError.
+      try {
+        return chooseIntentKey(endpointId) !== null;
+      } catch {
+        return false;
+      }
     },
 
     async post(opts) {
-      const chosen = chooseIntentKey(opts.endpointId);
+      let chosen: ReturnType<typeof chooseIntentKey>;
+      try {
+        chosen = chooseIntentKey(opts.endpointId);
+      } catch {
+        chosen = null; // an unsigned post to a signing room bounces 401 with the server's words
+      }
       return deliverIntent({
         baseUrl: client.baseUrl,
         projectId: opts.projectId,

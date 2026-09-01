@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { readJsonStore, writeJsonStore } from './store.js';
 
 /**
  * Multi-credential keystore (7a follow-on): `~/.flurryport/keystore.json`, a keyed
@@ -28,26 +28,41 @@ interface KeystoreFile {
 
 const KEYSTORE_PATH = join(homedir(), '.flurryport', 'keystore.json');
 
-function load(): KeystoreFile {
-  try {
-    if (existsSync(KEYSTORE_PATH)) {
-      const parsed = JSON.parse(readFileSync(KEYSTORE_PATH, 'utf8')) as KeystoreFile;
-      if (parsed && parsed.credentials) return parsed;
-    }
-  } catch {
-    /* corrupt keystore reads as empty; the next save rewrites it */
+/**
+ * A persistent lock/permission failure on the keystore, with a message CLEAN
+ * enough for any surface (round 3): the raw ErrnoException names the absolute
+ * path with the username in it, and an MCP handler that lets it escape hands
+ * that to a remote client - the store keeps the real error as `cause` for the
+ * operator log.
+ */
+export class KeystoreUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super('The local keystore (~/.flurryport/keystore.json) is locked or unreadable right now.');
+    this.name = 'KeystoreUnavailableError';
+    (this as { cause?: unknown }).cause = cause;
   }
+}
+
+function load(): KeystoreFile {
+  // Corrupt keystore reads as empty; the next save rewrites it. A persistent
+  // lock (the store already retried) surfaces as the clean typed error - NEVER
+  // as silent emptiness: "no signing key" and "cannot read the keys" are
+  // different answers (round 3; the same truth-telling as briefingNote).
+  let parsed: KeystoreFile | null;
+  try {
+    parsed = readJsonStore<KeystoreFile>(KEYSTORE_PATH);
+  } catch (err) {
+    throw new KeystoreUnavailableError(err);
+  }
+  if (parsed && parsed.credentials) return parsed;
   return { version: 1, credentials: {} };
 }
 
 function save(store: KeystoreFile): void {
-  const dir = join(homedir(), '.flurryport');
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(KEYSTORE_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
   try {
-    chmodSync(KEYSTORE_PATH, 0o600); // writeFileSync mode is ignored on an existing file
-  } catch {
-    /* best-effort on platforms without POSIX modes (Windows ACLs) */
+    writeJsonStore(KEYSTORE_PATH, store);
+  } catch (err) {
+    throw new KeystoreUnavailableError(err);
   }
 }
 

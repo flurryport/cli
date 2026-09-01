@@ -7,6 +7,8 @@ import { ApiError, createApiClient } from '../lib/api.js';
 import { guidToBase62 } from '../lib/base62.js';
 import { isLocalTarget } from '../lib/local-target.js';
 import { friendlyFetchError } from '../lib/fetch-error.js';
+import { sanitizeWireLine } from '../lib/sanitize.js';
+import { startSerialPoll } from '../lib/serial-poll.js';
 
 // Server returns DateTime.UtcNow values, but EF Core reads SQL datetime
 // columns as Kind=Unspecified, so the JSON serializer drops the Z suffix.
@@ -116,7 +118,7 @@ async function selectTarget(choices: TargetChoice[]): Promise<TargetChoice> {
   choices.forEach((c, i) => {
     const auto = c.target.AutoReplay ? chalk.green(' auto') : '';
     console.log(`  ${chalk.bold(String(i + 1))}. ${c.target.BaseUrl}${auto}`);
-    console.log(`     ${chalk.dim(`${c.project.Slug} / ${c.endpoint.Slug} — ${c.target.Name}`)}`);
+    console.log(`     ${chalk.dim(`${c.project.Slug} / ${c.endpoint.Slug} - ${c.target.Name}`)}`);
   });
 
   const answer = await prompt(`\nAttach to (1-${choices.length}): `);
@@ -152,7 +154,8 @@ interface ForwardResult {
   error: string | null;
 }
 
-async function forwardCapture(capture: CapturedRequest, forwardUrl: string): Promise<ForwardResult> {
+/** Exported for the precedent-#5 harness: the printed line is wire-driven and must stay escape-free. */
+export async function forwardCapture(capture: CapturedRequest, forwardUrl: string): Promise<ForwardResult> {
   let body: Buffer | undefined;
   if (capture.BodyBytes) {
     body = Buffer.from(capture.BodyBytes, 'base64');
@@ -171,8 +174,10 @@ async function forwardCapture(capture: CapturedRequest, forwardUrl: string): Pro
       body,
     });
     const duration = Date.now() - start;
-    const provider = capture.ProviderHint ? chalk.cyan(`[${capture.ProviderHint}]`) : '';
-    const eventType = capture.ProviderEventType ?? capture.HttpMethod;
+    // Wire data drives this terminal line: an unauthenticated capture body can carry
+    // ANSI escapes in its provider fields (precedent #5) - strip before printing.
+    const provider = capture.ProviderHint ? chalk.cyan(`[${sanitizeWireLine(capture.ProviderHint)}]`) : '';
+    const eventType = sanitizeWireLine(capture.ProviderEventType ?? capture.HttpMethod ?? '');
     const status = res.status < 300
       ? chalk.green(`${res.status} ${res.statusText}`)
       : chalk.red(`${res.status} ${res.statusText}`);
@@ -295,8 +300,14 @@ export const listenCommand = new Command('listen')
           // Print run header when a new sequence is seen
           if (exec.SequenceId && !seenSequences.has(exec.SequenceId)) {
             seenSequences.add(exec.SequenceId);
+            // Bound the set for long-lived listens (precedent #4): evict oldest
+            // first - worst case a very old sequence reprints its header line.
+            if (seenSequences.size > 500) {
+              const oldest = seenSequences.values().next().value;
+              if (oldest !== undefined) seenSequences.delete(oldest);
+            }
             runCounter++;
-            const label = exec.CollectionName ?? `Run ${runCounter}`;
+            const label = exec.CollectionName ? sanitizeWireLine(exec.CollectionName) : `Run ${runCounter}`;
             console.log(chalk.bold.cyan(`\n── ${label} ──`));
           }
 
@@ -359,6 +370,7 @@ export const listenCommand = new Command('listen')
       }
     };
 
-    await poll();
-    setInterval(poll, interval);
+    // Precedent #4: serial polling - a batch slower than the interval must never
+    // overlap the next tick and forward the same execution twice.
+    startSerialPoll(poll, interval);
   });

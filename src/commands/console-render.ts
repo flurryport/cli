@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import { RECORD_SUMMARY_CHARS, type ConsoleEvent } from '../lib/console-engine.js';
 import { consoleMessages as msg } from '../lib/console-messages.js';
+import { sanitizeWireLine } from '../lib/sanitize.js';
 import {
   ALL_CONSOLE_COLORS,
   CONSOLE_COLORS,
@@ -189,7 +190,7 @@ export function renderEvent(event: ConsoleEvent, width: number): string[] {
         if (s.greyed) {
           const heldGrey = s.held ? '  ' + msg.rosterHeldMark : '';
           const hiddenGrey = s.hidden ? '  hidden' : '';
-          return chalk.gray(`  :${s.handle}  ${s.guestName}  ${stateWord}${heldGrey}${hiddenGrey}`);
+          return chalk.gray(`  :${s.handle}  ${sanitizeWireLine(s.guestName)}  ${stateWord}${heldGrey}${hiddenGrey}`);
         }
         const liveness =
           s.presence === 'live'
@@ -203,7 +204,7 @@ export function renderEvent(event: ConsoleEvent, width: number): string[] {
                   : chalk.dim(stateWord);
         const held = s.held ? chalk.dim('  ' + msg.rosterHeldMark) : '';
         const hidden = s.hidden ? chalk.dim('  hidden') : '';
-        return `  ${paint(s.color, ':' + s.handle)}  ${s.guestName}  ${liveness}${held}${hidden}`;
+        return `  ${paint(s.color, ':' + s.handle)}  ${sanitizeWireLine(s.guestName)}  ${liveness}${held}${hidden}`;
       });
     case 'decisions':
       // The decision ledger (#295): every flagged proposal, chronological, in

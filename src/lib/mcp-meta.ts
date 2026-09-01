@@ -76,6 +76,13 @@ export interface MetaNotice {
     | 'attention_resume';
   message: string;
   viewerUrl?: string;
+  /**
+   * Notice ladder (2026-08-31 incident, product rec 2): 'advisory' = act when
+   * convenient (a newer CLI exists); 'blocking' = the call you are making rides a
+   * superseded flow and its artifact may not work - stop and relay. Absent reads
+   * as advisory (older notices carry no severity).
+   */
+  severity?: 'advisory' | 'blocking';
 }
 
 /**

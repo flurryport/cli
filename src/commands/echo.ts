@@ -21,7 +21,7 @@ import chalk from 'chalk';
  * `X-Echo-X-Api-Key: [REDACTED:STRIPE_KEY]`.
  */
 export const echoCommand = new Command('echo')
-  .description('Local HTTP receiver that 200s, logs, and mirrors every request header + body back — pair with `listen` to dogfood a bridge without a backend')
+  .description('Local HTTP receiver that 200s, logs, and mirrors every request header + body back - pair with `listen` to dogfood a bridge without a backend')
   .argument('[port]', 'Port to listen on (default: 3000)', '3000')
   .option('--host <host>', 'Interface to bind on. Defaults to localhost (whichever of 127.0.0.1 / ::1 your OS resolver returns). Pass 127.0.0.1, ::1, 127.0.0.5, 0.0.0.0, etc. to bind a specific address.', 'localhost')
   .option('--path <path>', 'Only respond 200 on this path; other paths return 404. Default: respond 200 on every path.')
@@ -108,7 +108,7 @@ export const echoCommand = new Command('echo')
       if (err.code === 'EADDRINUSE') {
         console.error(chalk.red(`${host}:${port} is already in use.`));
       } else if (err.code === 'EADDRNOTAVAIL') {
-        console.error(chalk.red(`Cannot bind ${host} — no network interface has that address.`));
+        console.error(chalk.red(`Cannot bind ${host} - no network interface has that address.`));
       } else {
         console.error(chalk.red(`Server error: ${err.message}`));
       }

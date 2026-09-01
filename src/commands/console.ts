@@ -8,7 +8,7 @@ import { AuthApiError, createAuthApiClient, resolveAuthBaseUrl } from '../lib/au
 import { createRoomApi } from '../lib/console-room.js';
 import { ConsoleEngine, type RoomHost } from '../lib/console-engine.js';
 import { consoleMessages as msg } from '../lib/console-messages.js';
-import { friendlyFetchError } from '../lib/fetch-error.js';
+import { friendlyFetchError, setOutboundErrorLog } from '../lib/fetch-error.js';
 import { serveMcpHttp, type McpHttpHandle } from '../lib/mcp-http.js';
 import { buildSeatServer } from '../lib/mcp-seat-tools.js';
 import { resolveRoomsStandingIdleMinutes } from '../lib/rooms.js';
@@ -107,6 +107,9 @@ export const consoleCommand = new Command('console')
       const room = engine.roomInfo();
       return room ? `${room.projectSlug}/${room.endpointSlug}` : null;
     };
+    // Review finding 7: sanitized outbound errors log through the same seam as
+    // the room's own lines - never raw stderr across the readline UI mid-session.
+    setOutboundErrorLog((line) => frontend.note(line));
     const startRoom = (port: number): Promise<McpHttpHandle> =>
       serveMcpHttp({
         host: '127.0.0.1',

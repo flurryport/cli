@@ -27,7 +27,7 @@ const program = new Command();
 
 program
   .name('flurryport')
-  .description('FlurryPORT CLI — forward webhook captures to your local machine')
+  .description('FlurryPORT CLI - forward webhook captures to your local machine')
   .version(pkg.version);
 
 program.addCommand(loginCommand);
@@ -44,4 +44,10 @@ program.addCommand(seatServerCommand);
 program.addCommand(seatCommand);
 program.addCommand(consoleCommand);
 
-program.parse();
+// Round 3: one friendly floor for errors no command handled - notably the store's
+// locked-config throw (finding 9's loud-by-design contract). A clean one-line
+// message beats an unhandled-rejection stack for the operator.
+void program.parseAsync().catch((err: unknown) => {
+  console.error(`flurryport: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+});

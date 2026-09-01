@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CatalogApiError, getRecipe, lintRecipe, listRecipes, rankRecipesByQuery, resolveCatalogBaseUrl } from './catalog-api.js';
+import { sanitizeOutboundError } from './fetch-error.js';
 import { resolveWebBaseUrl } from './mcp-meta.js';
 import { verifyChain } from './hashchain.js';
 
@@ -37,7 +38,7 @@ function mapError(err: unknown, notFoundHint: string) {
     }
     return fail(err.status, err.message, 'The catalog API answered with an error; try again shortly.');
   }
-  return fail(undefined, err instanceof Error ? err.message : 'Catalog request failed.',
+  return fail(undefined, sanitizeOutboundError(err).message,
     `Could not reach the recipe catalog at ${resolveCatalogBaseUrl()}. If this is a local stack, set FLURRYPORT_CATALOG_URL.`);
 }
 
@@ -267,9 +268,10 @@ export function registerCatalogTools(server: McpServer): RegisteredTool[] {
         'chain. Inputs: events, the parsed bodies in sequence order oldest first, and optionally hashField ' +
         'and genesisPrevHash. Returns intact, brokenAt for the index of the first break, count, and ' +
         'nextPrevHash, the exact prevHash for YOUR next event. Canonicalization is RFC 8785 JCS: keys ' +
-        'sorted at every level, sig excluded, no whitespace. Pure computation, and it works with no account.',
+        'sorted at every level, top-level sig excluded, nested sigs hashed. ' +
+        'Pure computation; needs no account.',
       inputSchema: {
-        events: z.array(z.record(z.string(), z.unknown()))
+        events: z.array(z.record(z.string(), z.unknown())).max(5000)
           .describe('The event bodies to verify, in sequence order (oldest first).'),
         hashField: z.string().max(100).optional()
           .describe('Name of the prev-hash pointer field (default "prevHash").'),
@@ -286,9 +288,16 @@ export function registerCatalogTools(server: McpServer): RegisteredTool[] {
         brokenAt: result.brokenAt,
         count: result.count,
         nextPrevHash: result.nextPrevHash,
+        ...(result.legacyIntact !== undefined ? { legacyIntact: result.legacyIntact } : {}),
         hint: result.intact
           ? `Chain intact across ${result.count} event(s). Use nextPrevHash as prevHash on your next post_intent event.`
-          : `Chain breaks at event ${result.brokenAt}: its prevHash does not match the canonical hash of the previous event. Do not extend it - re-read the log and reconcile (a fork is a visible dispute, not a merge).`,
+          : result.legacyIntact
+            ? `Chain breaks at event ${result.brokenAt} under the CURRENT canonicalization rules but verifies intact ` +
+              'under the pre-0.6.4 rules (nested sig fields were not hashed; a missing pointer read as genesis). ' +
+              'This is a legitimate legacy chain, NOT tampering. Tell your human. nextPrevHash is the legacy tail ' +
+              'hash: extending with it keeps the whole chain verifiable (still disclosed as legacy on every verify). ' +
+              'Start a fresh log to get strict verification.'
+            : `Chain breaks at event ${result.brokenAt}: its prevHash does not match the canonical hash of the previous event. Do not extend it - re-read the log and reconcile (a fork is a visible dispute, not a merge).`,
       });
     },
   ));

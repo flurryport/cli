@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { readJsonStore, writeJsonStore } from './store.js';
 
 export interface AccountConfig {
   apiKey: string;
@@ -66,16 +66,11 @@ const DEFAULT_CONFIG: FlurryConfig = {
 };
 
 export function loadConfig(): FlurryConfig {
-  if (!existsSync(CONFIG_FILE)) return structuredClone(DEFAULT_CONFIG);
-  try {
-    const raw = readFileSync(CONFIG_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    const migrated = migrateConfig(parsed);
-    if (migrated !== parsed) saveConfig(migrated);
-    return migrated;
-  } catch {
-    return structuredClone(DEFAULT_CONFIG);
-  }
+  const parsed = readJsonStore<unknown>(CONFIG_FILE);
+  if (parsed === null) return structuredClone(DEFAULT_CONFIG);
+  const migrated = migrateConfig(parsed);
+  if (migrated !== parsed) saveConfig(migrated);
+  return migrated;
 }
 
 /**
@@ -156,9 +151,10 @@ export function isDefaultProdOnly(config: FlurryConfig): boolean {
   );
 }
 
+// config.json holds fp_ PATs: the shared store gives it the keystore's 0600
+// discipline and an atomic write (precedent 10 - it was world-readable before).
 export function saveConfig(config: FlurryConfig): void {
-  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+  writeJsonStore(CONFIG_FILE, config);
 }
 
 export function getEnvironment(config: FlurryConfig, name?: string): { name: string; env: EnvironmentConfig } {

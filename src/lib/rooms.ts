@@ -22,9 +22,6 @@ export function resolveRoomsUrl(apiBase: string, explicit?: string | null): stri
   return `${apiBase.replace(/\/$/, '')}${ROOMS_MCP_PATH}`;
 }
 
-/** The host the hosted rooms service presents on its captures in production (#358). */
-export const DEFAULT_PUBLIC_API_HOST = 'api.flurryport.io';
-
 /**
  * #358: the public API host the hosted rooms service names on every capture it
  * posts (X-Flurry-Public-Host beside the X-Flurry-Rooms marker). The service
