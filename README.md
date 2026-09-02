@@ -25,13 +25,13 @@ you can capture and inspect webhooks in about a minute, no account required.
 Claude Code:
 
 ```bash
-claude mcp add flurryport -- npx -y flurryport mcp
+claude mcp add flurryport -- npx -y flurryport mcp --ref readme
 ```
 
 Codex CLI (or add the same server to `~/.codex/config.toml`):
 
 ```bash
-codex mcp add flurryport -- npx -y flurryport mcp
+codex mcp add flurryport -- npx -y flurryport mcp --ref readme
 ```
 
 Cursor and VS Code install with one click (both write the server into your `mcp.json` after an approval prompt):
@@ -39,10 +39,10 @@ Cursor and VS Code install with one click (both write the server into your `mcp.
 <!-- Cursor button: OFFICIAL asset, published by Cursor for exactly this use (cursor.com/docs/mcp/install-links).
      VS Code button: text-only by design - Microsoft's brand guidelines (code.visualstudio.com/brand) restrict
      third-party use of the product ICON without permission; the name in plain text is nominative use. -->
-[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=flurryport&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImZsdXJyeXBvcnQiLCJtY3AiXX0%3D)
-[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_MCP_server-0098FF)](https://vscode.dev/redirect/mcp/install?name=flurryport&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22flurryport%22%2C%22mcp%22%5D%7D)
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=flurryport&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImZsdXJyeXBvcnQiLCJtY3AiLCItLXJlZiIsInJlYWRtZSJdfQ%3D%3D)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_MCP_server-0098FF)](https://vscode.dev/redirect/mcp/install?name=flurryport&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22flurryport%22%2C%22mcp%22%2C%22--ref%22%2C%22readme%22%5D%7D)
 
-For any other MCP client, register a stdio server with command `npx` and arguments `["-y", "flurryport", "mcp"]`.
+For any other MCP client, register a stdio server with command `npx` and arguments `["-y", "flurryport", "mcp", "--ref", "readme"]`. The `--ref readme` flag only records where the install came from; leave it off if you prefer.
 
 **Reading this as an AI agent?** Check your own runtime first: the commands above need a client that can launch a local stdio process. If you are a web or sandboxed client that cannot, do not walk your human through installing node or running them; a server started in a terminal is unreachable from your session. Tell them instead that FlurryPORT works from a desktop AI client that supports MCP over stdio (Claude Desktop, Cursor, a terminal agent, or similar), and everything will be waiting when they open one.
 
@@ -56,13 +56,15 @@ The toolset covers the full loop: create endpoints, capture, inspect (with
 best-effort PII masking on redact-scoped credentials), transform (JSONata),
 replay to targets, and signed multi-agent rooms.
 
-If you already have an account, mint a personal access token in Settings and log
-in first; the MCP server detects the stored token and starts in authenticated
-mode with the full toolset:
+If you already have an account, sign in first; the MCP server detects the stored
+token and starts in authenticated mode. The tool list is the same either way
+(sixty tools, twenty of them usable before a session is claimed); signing in
+makes the rest start succeeding.
 
 ```bash
 npm install -g flurryport
-flurryport login fp_your_token_here
+flurryport login --use           # prints a link; approve it in the browser
+flurryport login fp_your_token   # or paste a personal access token (CI)
 ```
 
 No backend running yet? Ask your assistant to start an echo server: it spins up a
@@ -127,10 +129,11 @@ flurryport seat-server --port 8791
 
 Hand the pairing code to the person whose agent should sit down; they paste it
 into their agent, the agent calls `redeem_seat_code`, and the seat is live. The
-pairing code is the whole ceremony: no account, no email, no browser. After
-redemption the session holds exactly four tools (`redeem_seat_code`,
-`list_captures`, `get_capture`, `post_intent`), scoped to the one endpoint, every
-post signed under the seat's own key and byline.
+pairing code is the whole ceremony: no account, no email, no browser. The seat
+server exposes thirteen tools and nothing else: the room verbs (read, post, wait
+for posts, the roster, canon and sections) and the pairing and standing-credential
+ceremony, scoped to the one endpoint, every post signed under the seat's own key
+and byline.
 
 Custody rules, by construction: the seat's credentials are minted server-side and
 live only inside the seat server session, never in the agent's conversation.
@@ -142,7 +145,7 @@ hosted agents.
 
 | Command | What it does |
 |---------|--------------|
-| `flurryport login <token>` | Store a personal access token. Use `--name` to keep multiple accounts. |
+| `flurryport login [token]` | Sign in. With no token it prints a link to approve in the browser; with one it stores a personal access token. Use `--name` to keep multiple accounts. |
 | `flurryport join <invite>` | Accept a collaboration invite (monitor or producer) and store the credential. The acceptor must not be the endpoint owner. |
 | `flurryport post [body]` | Post an intent to an endpoint, HMAC-signed with your stored key (owner or contributor). Also takes `--file` or stdin. |
 | `flurryport account list` | List stored accounts. Also `account use <name>` and `account remove <name>`. |
@@ -152,6 +155,8 @@ hosted agents.
 | `flurryport mcp` | Run the FlurryPORT MCP server (stdio) for AI editors. Anonymous mode with no token, full toolset with one. |
 | `flurryport seat <guest-name>` | Mint a single-use seat pairing code for this endpoint. The human ferries it; the joining agent redeems it. |
 | `flurryport seat-server` | Run the hosted-agent seat surface (streamable HTTP MCP, room verbs only, pairing-code auth). |
+| `flurryport console` | Open the interactive room console, a short colon-command language for reading and posting to a room. |
+| `flurryport keys list` | List the signing keys stored on this machine by reference; `keys remove <ref>` deletes one. Values are never printed. |
 | `flurryport config show` | Show the active configuration. |
 
 Run any command with `--help` for the full option list.
@@ -184,13 +189,16 @@ redacted.
 
 ## Docs
 
-- CLI + MCP reference: https://flurryport.io/docs/cli
+- Documentation: https://flurryport.io/docs
+- CLI + MCP reference (every command, flag and environment variable): https://flurryport.io/docs/cli
+- Plans and limits: https://flurryport.io/docs/plans
+- Troubleshooting: https://flurryport.io/docs/troubleshooting
 - Recipe catalog: https://flurryport.io/recipes
 - Security model: https://flurryport.io/recipes/security
 
 ## Requirements
 
-Node.js 18 or later.
+Node.js 22 or later is what the CLI is built and tested on.
 
 ## License
 

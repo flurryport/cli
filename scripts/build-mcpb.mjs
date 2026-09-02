@@ -46,29 +46,41 @@ execSync('npm install --omit=dev --no-audit --no-fund --no-package-lock', {
   stdio: 'inherit',
 });
 
+// Per-channel attribution (Gene, 2026-08-31 gavel, board #465): a bundle is a
+// frozen snapshot, so every directory that hosts one gets its own build with its
+// own --ref. Set MCPB_REF=smithery (etc.) when building for a channel; with it
+// unset the bundle carries no --ref and its installs are invisible in the funnel.
+const ref = process.env.MCPB_REF?.trim();
+if (!ref) console.warn('\nWARNING: MCPB_REF is not set; this bundle will carry no --ref attribution.\n');
+
+// Description strings follow the 09-01 ladder: `description` is the short form
+// (shared with server.json, under the official registry's 100-char cap) and
+// `long_description` is the paragraph form. Keywords mirror package.json.
 const manifest = {
   manifest_version: '0.3',
   name: 'flurryport',
   display_name: 'FlurryPORT',
   version: pkg.version,
-  description: 'Capture, inspect, and replay webhooks with no signup; install signed delivery recipes from the catalog.',
+  description: 'Webhook capture and replay, delivery pipes, and signed multi-agent rooms. No signup to start.',
   long_description:
-    'FlurryPORT gives your AI agent webhook tools: mint a capture URL, watch events land, ' +
-    'forward them to localhost, replay them, and register standing watches. The catalog adds ' +
-    'signed delivery recipes (Slack, GitHub, Telegram, ntfy and more) where credentials stay ' +
-    'server-side and every delivery returns a receipt. Anonymous sessions work instantly; ' +
-    'claiming one in the browser upgrades the same tools to your account.',
+    'FlurryPORT captures incoming webhooks exactly as they arrive, headers and body and query ' +
+    'string, byte for byte, and replays them to your machine with the signature still valid. ' +
+    'The same capture can drive an action: an agent sends a typed intent, FlurryPORT holds the ' +
+    'credential and makes the call, and hands back what the service actually said, with a ' +
+    'receipt. Rooms give several agents and their people one endpoint to write to, so the ' +
+    'record of a decision is the same record for everyone who was in it. Anonymous sessions ' +
+    'work instantly; claiming one in the browser upgrades the same tools to your account.',
   author: { name: 'Spill Coffee LLC', url: 'https://flurryport.io' },
   homepage: 'https://flurryport.io',
   documentation: 'https://flurryport.io/docs/cli',
-  license: 'SEE LICENSE ON https://flurryport.io',
-  keywords: ['webhooks', 'mcp', 'capture', 'replay', 'agents'],
+  license: pkg.license,
+  keywords: pkg.keywords,
   server: {
     type: 'node',
     entry_point: 'server/dist/index.js',
     mcp_config: {
       command: 'node',
-      args: ['${__dirname}/server/dist/index.js', 'mcp'],
+      args: ['${__dirname}/server/dist/index.js', 'mcp', ...(ref ? ['--ref', ref] : [])],
     },
   },
 };

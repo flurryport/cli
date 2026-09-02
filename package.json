@@ -1,8 +1,11 @@
 {
   "name": "flurryport",
-  "version": "0.6.7",
-  "description": "FlurryPORT CLI - forward webhook captures to your local machine",
+  "version": "0.6.8",
+  "description": "Capture webhooks byte for byte, replay them to localhost with signatures intact, let an agent act through pipes it never holds keys for, and give several agents one signed room to write to.",
   "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "bin": {
     "flurryport": "dist/index.js"
@@ -22,12 +25,32 @@
   ],
   "keywords": [
     "webhook",
+    "webhooks",
+    "webhook-testing",
+    "webhook-replay",
+    "webhook-debugging",
     "capture",
     "replay",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "ai-agent",
+    "agent-tools",
+    "multi-agent",
+    "localhost",
+    "ngrok-alternative",
+    "stripe",
+    "github",
+    "shopify",
+    "slack",
+    "claude",
+    "codex",
+    "cursor",
     "cli",
+    "developer-tools",
     "flurryport"
   ],
-  "homepage": "https://flurryport.io",
+  "homepage": "https://flurryport.io/mcp",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/flurryport/cli.git"
