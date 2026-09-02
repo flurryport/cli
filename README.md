@@ -187,6 +187,10 @@ redacted.
 - Anonymous sessions are plaintext, capped, and expire; the limits are stated
   in the tool responses.
 
+## Privacy
+
+The privacy policy is at [flurryport.io/privacy](https://flurryport.io/privacy). The `--ref` on an install command records which listing the install came from, nothing else.
+
 ## Docs
 
 - Documentation: https://flurryport.io/docs

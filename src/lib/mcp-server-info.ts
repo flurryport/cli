@@ -29,6 +29,7 @@ export function registerServerInfoTool(server: McpServer, source: ServerInfoSour
   server.registerTool(
     'get_server_info',
     {
+      title: 'Server info',
       description:
         'Identity and health of this FlurryPORT MCP server: CLI version, API base URL, session mode ' +
         '(authenticated or anonymous), server reachability, and whether a newer CLI version is available. ' +

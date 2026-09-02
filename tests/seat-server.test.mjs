@@ -160,6 +160,9 @@ function startFakeApi() {
     orientationCaptureId: CAP_GUID, // null emulates a room with no orientation
     canonRecap: 'Plain words, no hype.',
     betaStaleServed: false,
+    standing: null,        // #478: extra members merged into alpha's redemption release
+    exchanges: [],         // every Credential presented to the standing exchange
+    exchangeAnswers: 200,  // 404 emulates a lane the server did not re-open
   };
   const release = (name) => ({
     Token: `fp_seat_${name}`,
@@ -190,7 +193,7 @@ function startFakeApi() {
         }
         if (parsed.CodeHandle === 'ABCD' && verifyFakeProof(CODE_A, parsed)) {
           // #274: the server issues the join boundary WITH the redemption.
-          return json(200, { ...release('alpha'), JoinedAtCursor: 'jc-boundary' });
+          return json(200, { ...release('alpha'), JoinedAtCursor: 'jc-boundary', ...(state.standing ?? {}) });
         }
         if (parsed.CodeHandle === 'PQRS' && verifyFakeProof(CODE_B, parsed)) {
           if (!state.betaStaleServed) {
@@ -202,6 +205,23 @@ function startFakeApi() {
         }
         // Unknown / wrong proof: the non-enumerable answer.
         return json(404, { title: 'not_found', detail: 'Not found' });
+      }
+      if (req.method === 'POST' && req.url === '/api/v1/invites/seats/standing/exchange') {
+        // #478: the first-collection lane, re-opened by redemption for a handle that
+        // already holds standing. Only the fresh seat token may exchange.
+        const { Credential } = JSON.parse(body);
+        state.exchanges.push(Credential);
+        if (state.exchangeAnswers !== 200 || Credential !== 'fp_seat_alpha') {
+          return json(404, { title: 'not_found', detail: 'Not found' });
+        }
+        return json(200, {
+          ...release('alpha'),
+          Token: 'fp_working_alpha_1',
+          StandingKey: 'stk_alpha_1',
+          Custody: 'unattended',
+          JoinedAtCursor: 'jc-boundary',
+          ResumeCursor: 'rc-last-ack',
+        });
       }
       if (req.method === 'GET' && req.url === '/api/v1/projects/PSEAT/endpoints/EPSEAT/sections') {
         state.briefs.push({ url: req.url, auth: req.headers.authorization ?? null });
@@ -1133,6 +1153,79 @@ test('#358: a hosted rooms server marks its posts with the rooms marker and the 
 });
 
 // ───────────────────── E. the room brief (#345) and the post budget (#361) ─────────────────────
+
+// #478: standing at redemption. The seat acts on the receipt's standing facts in
+// the same step, so no human ever has to tell a seat to ask for what it holds.
+test('redeem_seat_code: an older server (no standing facts) yields a plain seated receipt', async () => {
+  const { srv, base: apiBase } = await startFakeApi();
+  try {
+    const tools = collectTools((s) => registerSeatTools(s, { apiBase }));
+    const seated = JSON.parse((await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal(seated.status, 'seated');
+    assert.equal('standing' in seated, false, 'absent-because-old must not masquerade as a step');
+    assert.match(seated.custody, /fresh code from the host\.$/);
+  } finally {
+    srv.close();
+  }
+});
+
+test('redeem_seat_code: a pre-authorized slot puts the consent step in the receipt, before any work', async () => {
+  const { srv, base: apiBase, state } = await startFakeApi();
+  try {
+    state.standing = { StandingPreAuthorized: true, StandingLive: false, StandingCustody: null };
+    const tools = collectTools((s) => registerSeatTools(s, { apiBase }));
+    const seated = JSON.parse((await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal(seated.status, 'seated');
+    assert.equal(seated.standing.state, 'pre_authorized');
+    assert.match(seated.standing.next, /BEFORE any other work/);
+    assert.match(seated.standing.next, /request_standing_credential/);
+    assert.match(seated.custody, /or standing once the step above is done\.$/);
+    assert.equal(state.exchanges.length, 0, 'no grant yet, so nothing to collect');
+  } finally {
+    srv.close();
+  }
+});
+
+test('redeem_seat_code: a handle that already holds standing is re-attached by the redemption itself', async () => {
+  const { srv, base: apiBase, state } = await startFakeApi();
+  try {
+    state.standing = { StandingPreAuthorized: true, StandingLive: true, StandingCustody: 'unattended' };
+    const tools = collectTools((s) => registerSeatTools(s, { apiBase }));
+    const text = (await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text;
+    const seated = JSON.parse(text);
+    assert.equal(seated.status, 'standing', text);
+    assert.equal(seated.collectedAt, 'redemption');
+    assert.match(seated.standingNote, /one step/);
+    assert.equal(seated.standingKey, 'stk_alpha_1', 'the one credential that may surface, exactly as attach_standing hands it');
+    assert.equal(seated.custodyMode, 'unattended');
+    assert.equal(seated.resumeCursor, 'rc-last-ack');
+    assert.deepEqual(state.exchanges, ['fp_seat_alpha'], 'the fresh seat token is the proof');
+    assert.equal(text.includes('fp_working_alpha_1'), false, 'the working token never surfaces');
+    assert.equal(text.includes('fp_seat_alpha'), false, 'nor the seat token');
+    // The seat is standing: the room verbs read with the rotated working token.
+    await tools.get('list_captures').handler({});
+    assert.equal(state.reads.at(-1).auth, 'Bearer fp_working_alpha_1');
+  } finally {
+    srv.close();
+  }
+});
+
+test('redeem_seat_code: a failed collection leaves the seat seated and says to attach_standing', async () => {
+  const { srv, base: apiBase, state } = await startFakeApi();
+  try {
+    state.standing = { StandingPreAuthorized: true, StandingLive: true, StandingCustody: 'checked-in' };
+    state.exchangeAnswers = 404;
+    const tools = collectTools((s) => registerSeatTools(s, { apiBase }));
+    const seated = JSON.parse((await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal(seated.status, 'seated');
+    assert.equal(seated.standing.state, 'live_uncollected');
+    assert.equal(seated.standing.custodyMode, 'checked-in');
+    assert.match(seated.standing.next, /attach_standing \(no arguments\)/);
+    assert.equal(state.exchanges.length, 1);
+  } finally {
+    srv.close();
+  }
+});
 
 test('redeem_seat_code hands the seat the orientation and the canon, with the ids to re-read them', async () => {
   const { srv, state, base: apiBase } = await startFakeApi();

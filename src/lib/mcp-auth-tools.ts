@@ -29,6 +29,7 @@ import { consoleMessages } from './console-messages.js';
 import { resolveRoomsUrl } from './rooms.js';
 import { getChairIdentity } from './console-view-state.js';
 import { codeMinutesLeft, mintSeatInvite } from './seat-mint.js';
+import { toolTitle } from './tool-title.js';
 
 /**
  * Authenticated-mode tools (spec §5 / §12.4-12.5): Tier-1 reads + forward_to_localhost
@@ -546,6 +547,7 @@ function read(
   server.registerTool(
     name,
     {
+      title: toolTitle(name),
       description: description,
       inputSchema,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -634,6 +636,7 @@ export function registerAuthTools(server: McpServer, ctx: AuthToolContext): void
   server.registerTool(
     'get_capture_url',
     {
+      title: 'Get capture URL',
       description:
         "Return a capture URL the user pastes into their webhook provider (Stripe/GitHub/etc.), plus the web app " +
         'URL for browsing captures. Works the same before and after claiming. Omit ids to use the claimed or ' +
@@ -685,6 +688,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'start_echo_server',
     {
+      title: 'Start echo server',
       description:
         "Start or reuse a local echo receiver on the user's machine, so replay can be proven before their " +
         'real backend exists. It answers 200 and mirrors the method, headers, and body back, so a ' +
@@ -750,6 +754,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'get_capture_digest',
     {
+      title: 'Get capture digest',
       description:
         'Grouped digest of captures for a project: totals plus counts by endpoint, event type, provider, ' +
         'label, and hour, computed server-side. Facts only, never payloads. Use it INSTEAD of paging ' +
@@ -795,6 +800,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'register_watch',
     {
+      title: 'Register watch',
       description:
         'Register a standing watch on an endpoint: a JSONata predicate over $body, $headers, and $query, ' +
         'evaluated server-side against every future capture. Use it when the user wants specific events ' +
@@ -844,6 +850,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'list_watches',
     {
+      title: 'List watches',
       description:
         'List the watches on an endpoint with their facts: enabled state, match count, last match time, and ' +
         'last predicate error, since a broken watch shows its error here instead of failing captures. Use ' +
@@ -882,6 +889,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'set_watch_enabled',
     {
+      title: 'Enable or disable watch',
       description:
         'Enable or disable a watch by id (disable keeps its history and counters; there is no hard delete). ' +
         'Get ids from list_watches.',
@@ -908,6 +916,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'list_captures',
     {
+      title: 'List captures',
       description:
         'Read an endpoint: the captures it holds, newest first, as summaries. Inputs: includeBody to ' +
         'inline each body, skip and take for paging with limit accepted as an alias for take, after for ' +
@@ -967,6 +976,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'wait_for_captures',
     {
+      title: 'Wait for captures',
       description:
         'Block until a new capture lands on the endpoint or the timeout elapses, then return what is new ' +
         'since your cursor with bodies inline, exactly like list_captures with after. Use it for a ' +
@@ -1018,6 +1028,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'get_capture',
     {
+      title: 'Get capture',
       description:
         'Fetch one capture in full by id: headers, query string, and body. Inputs: captureId, with id ' +
         'accepted as an alias, and endpointId. The body is decrypted on read and returned as text when ' +
@@ -1149,6 +1160,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'create_collection',
     {
+      title: 'Create collection',
       description:
         'Create a named collection from one or more captures, PINNING them: members become ' +
         'retention-exempt and survive the plan\'s capture retention. Use it to preserve decisions, room ' +
@@ -1214,6 +1226,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'add_to_collection',
     {
+      title: 'Add to collection',
       description:
         'Append captures to an existing collection, PINNING them: the incremental half of ' +
         'create_collection, for a canon that grows over time. Inputs: collectionId, captureIds appended ' +
@@ -1283,6 +1296,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'remove_from_collection',
     {
+      title: 'Remove from collection',
       description:
         'Take one capture out of a collection. Use it to retire a pin that no longer belongs; to swap one ' +
         'for another, use replace_collection_item instead so the section is never momentarily empty. ' +
@@ -1346,6 +1360,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'replace_collection_item',
     {
+      title: 'Replace collection item',
       description:
         'Swap one capture for another in a collection, in one call: the replacement takes the slot the ' +
         'previous item held, then the previous item is removed. Use it when a section is re-ratified and ' +
@@ -1410,6 +1425,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'get_replay_target',
     {
+      title: 'Get replay target',
       description:
         'One replay target in detail, with its deliveryHeaders: the custom headers applied on top of the ' +
         'captured headers at delivery, whose values may be $secrets.NAME vault references resolved ' +
@@ -1446,6 +1462,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'capture_count',
     {
+      title: 'Count captures',
       description:
         'Cheap progress check: monthly quota usage, plus the accepted and rejected split, the latest ' +
         'capture timestamps, and the per-minute burst window when scoped with projectId and endpointId. ' +
@@ -1527,6 +1544,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'send_test_event',
     {
+      title: 'Send test event',
       description:
         "Send provider-shaped TEST webhooks to one of the user's capture endpoints, so they can exercise " +
         'the capture loop before the real provider is wired up. Bodies and headers light up provider and ' +
@@ -1647,6 +1665,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'forward_to_localhost',
     {
+      title: 'Forward to localhost',
       description:
         "Forward captured webhooks to a URL on the user's OWN machine, such as " +
         'http://localhost:3000/webhook or the start_echo_server URL. The CLI delivers locally and the ' +
@@ -1773,6 +1792,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'replay_to_target',
     {
+      title: 'Replay to target',
       description:
         'Replay one capture to a registered replay target, server-side. Inputs: captureId, targetId from ' +
         'list_replay_targets, and idempotencyKey. You CANNOT supply an arbitrary URL. ALWAYS confirm the ' +
@@ -2174,6 +2194,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'create_endpoint',
     {
+      title: 'Create endpoint',
       description:
         'Create a capture endpoint on a project: a stable inbound URL a sender gets pointed at, and the ' +
         'thing a room lives on. Use it when wiring a pipe that needs its own intake. Inputs: name, slug ' +
@@ -2220,6 +2241,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'create_transformation',
     {
+      title: 'Create transformation',
       description:
         'Create a named JSONata transformation on an endpoint: the reshape step that turns a capture into ' +
         'the exact shape one destination expects. Inputs: name, an optional description, expression, and ' +
@@ -2273,6 +2295,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'update_transformation',
     {
+      title: 'Update transformation',
       description:
         "Update an existing transformation's expression, name, or description instead of creating another. " +
         'Plans cap transformations per endpoint, so revising the one you have is the right move when a ' +
@@ -2325,6 +2348,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'bind_transformation',
     {
+      title: 'Bind transformation',
       description:
         'Arm a pipe: bind a transformation version to an endpoint and a replay target, so a capture ' +
         'matching the predicate runs the pinned version and delivers the result. Inputs: transformationId, ' +
@@ -2444,6 +2468,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'request_secret_setup',
     {
+      title: 'Request secret setup',
       description:
         'Ask FlurryPORT to email the endpoint owner a one-hour, single-use page where they paste the ' +
         'secret values a pipe references as $secrets.NAME. Inputs: checkOnly, recipeRef, secretNames, and ' +
@@ -2602,6 +2627,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'create_invite',
     {
+      title: 'Create invite',
       description:
         'Mint an invite link so another PERSON and their agent can join an endpoint you own. NOT for ' +
         'seating an AI agent in a room: agents join by pairing code (mint_seat); seat connectors cannot ' +
@@ -2692,6 +2718,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'mint_seat',
     {
+      title: 'Mint seat',
       description:
         'Mint a seat pairing code so ANOTHER AI agent can take a seat in a room on an endpoint you own. ' +
         'Inputs: guestName for the seat\'s byline on every post, hours for the seat life, codeMinutes for ' +
@@ -2812,6 +2839,8 @@ scopeFailure(ctx, 'endpoint'),
                 lifecycle: lifecycle ?? 'standing',
                 // Pass-copy sitting 2026-08-31: the preamble's one fill slot.
                 senderName: senderName ?? null,
+                // #478: the pass tells the seat its standing step exists.
+                standingPreAuthorized: standing === true && mint.standingPreAuthorized,
               })
               .join('\n'),
             hint:
@@ -2844,6 +2873,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'authorize_standing',
     {
+      title: 'Authorize standing',
       description:
         "Chair gate (#409): authorize a handle's standing-credential slot on an endpoint you own. " +
         'A parked ceremony (the human accepted; no slot) completes immediately - the steward never ' +
@@ -2892,6 +2922,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'list_members',
     {
+      title: 'List members',
       description:
         'List who holds access to an endpoint you own: accepted members with their participant name, role, ' +
         'and join date, plus every pending and past invite with its status. This is the host\'s roster. ' +
@@ -2940,6 +2971,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'revoke_invite',
     {
+      title: 'Revoke invite',
       description:
         'Revoke an invite on an endpoint you own: a pending invite\'s link stops working, and a redeemed ' +
         'SEAT invite is unseated on the spot - posting and reading stop, the log keeps its bylines, no ' +
@@ -2974,6 +3006,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'revoke_member',
     {
+      title: 'Revoke member',
       description:
         'Remove an accepted member from an endpoint you own: the membership row is deleted, their ' +
         'endpoint-scoped credentials are revoked, and their reads stop answering. Captures they already ' +
@@ -3009,6 +3042,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'create_replay_target',
     {
+      title: 'Create replay target',
       description:
         'Register a delivery destination, a replay target, on an endpoint. ASK the user which project and ' +
         'endpoint the pipe belongs on when placement is not obvious. Inputs: name, baseUrl, ' +
@@ -3076,6 +3110,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'update_replay_target',
     {
+      title: 'Update replay target',
       description:
         'Update a replay target in place, most importantly ARMING it with autoReplay true so standing ' +
         'bindings and fan-out deliver through it, or disarming it. Inputs: targetId, autoReplay, name, ' +
@@ -3136,6 +3171,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'set_target_headers',
     {
+      title: 'Set target headers',
       description:
         'Set the COMPLETE custom header set on a replay target. Full replace: include every header you ' +
         'want kept, and an empty array clears them all. Inputs: targetId, headers in send order, and ' +
@@ -3211,6 +3247,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'set_endpoint_signing',
     {
+      title: 'Set endpoint signing',
       description:
         'Set up or rotate signed-intent posting for an endpoint. Inputs: an optional header the signature ' +
         'rides in, and projectId plus endpointId. A high-entropy signing key is generated LOCALLY, stored ' +
@@ -3297,6 +3334,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'record_recipe_install',
     {
+      title: 'Record recipe install',
       description:
         'File the owner-side record of a recipe install, at the END of host setup, once the pipe is ' +
         'wired. Inputs: ref as publisher:slug, version as the pinned recipe version, contentHash from ' +
@@ -3382,6 +3420,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'set_orientation',
     {
+      title: 'Set orientation',
       description:
         'Set the room map. Marks captureId as the endpoint\'s current ORIENTATION, the one ' +
         'retention-exempt capture every room keeps on every plan, and stores sections and roster beside ' +
@@ -3489,6 +3528,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'list_sections',
     {
+      title: 'List sections',
       description:
         'Read the room state: the section map, each handle with what belongs there, the roster, each handle ' +
         'with its role of host, chair, producer, monitor, or relayed, and the current orientation capture ' +
@@ -3527,6 +3567,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'get_canon',
     {
+      title: 'Get canon',
       description:
         'Read what currently stands in each section of the room: one ratified recap per section, derived ' +
         'from the newest filing receipt for that section and checked against the collection the ruling is ' +
@@ -3567,6 +3608,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'post_intent',
     {
+      title: 'Post intent',
       description:
         'Speak into an endpoint: fire a pipe, or say something in a room. Inputs: body (a JSON string), ' +
         'contentType, and projectId plus endpointId, or neither for the claimed or only endpoint. On a ' +
@@ -3797,6 +3839,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'request_seat',
     {
+      title: 'Request seat',
       description:
         'Ask for a seat in a room you are only watching. A monitor reads but cannot post, so this lands ' +
         'the ask inside the room instead of out of band: an ordinary capture to the host on the roster ' +
@@ -3973,6 +4016,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'read_pipe_manifest',
     {
+      title: 'Read pipe manifest',
       description:
         'Read .flurryport/pipes.json from the working directory: the committed record of the pipes this ' +
         'repo delivers through, holding name, endpoint, recipe, transformation, intent schema, and signing ' +
@@ -4001,6 +4045,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'write_pipe_manifest',
     {
+      title: 'Write pipe manifest',
       description:
         'Record or remove a pipe entry in .flurryport/pipes.json, upserting by name, so the wiring survives ' +
         'restarts and travels with the repo. NEVER put a key or token value in any field: a signing key is ' +
@@ -4078,6 +4123,7 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'get_upgrade_options',
     {
+      title: 'Get upgrade options',
       description:
         'NOT for webhook debugging. Call it only when the user asks about pricing, plan limits, or ' +
         'upgrading, or hits a cap error. No inputs. Returns the live plan catalog: every plan with its ' +

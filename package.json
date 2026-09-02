@@ -1,6 +1,6 @@
 {
   "name": "flurryport",
-  "version": "0.6.8",
+  "version": "0.6.9",
   "description": "Capture webhooks byte for byte, replay them to localhost with signatures intact, let an agent act through pipes it never holds keys for, and give several agents one signed room to write to.",
   "license": "MIT",
   "engines": {
@@ -17,7 +17,8 @@
     "test": "npm run build && node --test tests/mcp-pacing.test.mjs tests/write-plane-libs.test.mjs tests/post-intent-and-search.test.mjs tests/credential-router.test.mjs tests/pilot1-hardening.test.mjs tests/seat-server.test.mjs tests/console.test.mjs tests/console-comfort.test.mjs tests/record-control.test.mjs tests/lifecycle.test.mjs tests/description-casing.test.mjs tests/mint-seat.test.mjs tests/set-orientation.test.mjs tests/hosted-rooms.test.mjs tests/room-canon.test.mjs tests/collection-edits.test.mjs tests/slice3-validation.test.mjs tests/slice4-mcp-surface.test.mjs tests/slice6-request-seat.test.mjs tests/recipe-version-pins.test.mjs tests/device-login.test.mjs tests/standing-attach.test.mjs tests/problem-details.test.mjs tests/store.test.mjs tests/session-isolation.test.mjs tests/ansi-sanitize.test.mjs tests/transport-guard.test.mjs",
     "test:nvim": "node nvim/tests/run.mjs",
     "prepublishOnly": "npm run build && node --test tests/mcp-pacing.test.mjs tests/write-plane-libs.test.mjs tests/post-intent-and-search.test.mjs tests/credential-router.test.mjs tests/pilot1-hardening.test.mjs tests/seat-server.test.mjs tests/console.test.mjs tests/console-comfort.test.mjs tests/record-control.test.mjs tests/lifecycle.test.mjs tests/description-casing.test.mjs tests/mint-seat.test.mjs tests/set-orientation.test.mjs tests/hosted-rooms.test.mjs tests/room-canon.test.mjs tests/collection-edits.test.mjs tests/slice3-validation.test.mjs tests/slice4-mcp-surface.test.mjs tests/slice6-request-seat.test.mjs tests/recipe-version-pins.test.mjs tests/device-login.test.mjs tests/standing-attach.test.mjs tests/problem-details.test.mjs tests/store.test.mjs tests/session-isolation.test.mjs tests/ansi-sanitize.test.mjs tests/transport-guard.test.mjs",
-    "build:mcpb": "npm run build && node scripts/build-mcpb.mjs"
+    "build:mcpb": "npm run build && node scripts/build-mcpb.mjs",
+    "build:mcpb:all": "npm run build && node scripts/build-mcpb-all.mjs"
   },
   "files": [
     "dist/**/*.js",

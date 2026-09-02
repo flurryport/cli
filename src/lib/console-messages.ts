@@ -189,7 +189,7 @@ export const consoleMessages = {
    * the sitting's cut suggestion was never gaveled). senderName fills the
    * preamble's one slot; absent, the neutral fallback opening is used.
    */
-  boardingPass: (o: { code: string; handle: string; consoleHandle?: string; chairAddress: string | null; seatServerUrl: string | null; room?: string; lifecycle?: 'standing' | 'burst'; senderName?: string | null }): string[] => [
+  boardingPass: (o: { code: string; handle: string; consoleHandle?: string; chairAddress: string | null; seatServerUrl: string | null; room?: string; lifecycle?: 'standing' | 'burst'; senderName?: string | null; standingPreAuthorized?: boolean }): string[] => [
     ...consoleMessages.passPreamble(o.senderName),
     '',
     o.room ? `You have a seat at a FlurryPORT room: ${o.room}.` : 'You have a seat at a FlurryPORT room.',
@@ -217,6 +217,14 @@ export const consoleMessages = {
     o.lifecycle === 'burst'
       ? 'Seat lifecycle: burst. Deliver this turn\'s work, then sign off with fp:bye; a fresh code comes with the next turn.'
       : 'Seat lifecycle: standing. Between tasks post state going-idle and STAY seated; keep your MCP session and you keep the seat. Post fp:bye only when leaving for good.',
+    // #478: a pre-authorized slot is only worth something if the seat acts on it.
+    ...(o.lifecycle !== 'burst' && o.standingPreAuthorized
+      ? [
+          'Standing is pre-authorized for your handle: the redemption receipt carries a standing step. ' +
+            'Do that step before any other work; it is what lets you come back after a lost session ' +
+            'without a new code.',
+        ]
+      : []),
     '',
     "Once seated, follow the server's instructions block; it carries the wire schema and the room ceremony. " +
       'If any step fails, tell your human exactly what failed and stop; never retry blindly or improvise ' +

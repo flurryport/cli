@@ -73,6 +73,10 @@ const manifest = {
   author: { name: 'Spill Coffee LLC', url: 'https://flurryport.io' },
   homepage: 'https://flurryport.io',
   documentation: 'https://flurryport.io/docs/cli',
+  // #479: the Anthropic directory wants an icon and a privacy policy on the
+  // manifest. The icon is the site favicon (both-theme plate), staged beside it.
+  icon: 'icon.png',
+  privacy_policies: ['https://flurryport.io/privacy'],
   license: pkg.license,
   keywords: pkg.keywords,
   server: {
@@ -85,9 +89,13 @@ const manifest = {
   },
 };
 writeFileSync(join(stage, 'manifest.json'), JSON.stringify(manifest, null, 2));
+cpSync(join(root, 'assets', 'icon.png'), join(stage, 'icon.png'));
 
 // The official packer validates the manifest and zips the stage.
-const bundlePath = join(out, 'flurryport.mcpb');
+// One bundle per channel (#464/#465): the ref is baked into the archive, so each
+// directory gets its own file, named for it, and an unattributed build keeps the
+// plain name so it cannot be mistaken for a channel build.
+const bundlePath = join(out, ref ? `flurryport-${ref}-${pkg.version}.mcpb` : `flurryport-${pkg.version}.mcpb`);
 execSync(`npx -y @anthropic-ai/mcpb@2 pack "${stage}" "${bundlePath}"`, {
   cwd: root,
   stdio: 'inherit',

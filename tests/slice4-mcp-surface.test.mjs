@@ -437,3 +437,29 @@ test('the measurement harness builds the same inventory the server registers (#3
   for (const [name, entry] of collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client, allowLan: false }))) collected.set(name, entry);
   assert.deepEqual([...ownerTools().keys()].sort(), [...collected.keys()].sort());
 });
+
+// #479: every tool carries a human title (the MCP `title` annotation) so a client
+// panel or a directory listing never has to show the snake_case name. Sentence
+// case, no underscores, short enough for a list row.
+test('every tool on every surface carries a sentence-case title (#479)', () => {
+  const client = limitClient({});
+  const surfaces = {
+    owner: collectTools((s) => registerAuthTools(s, { session: createAuthSessionState(), client, allowLan: false })),
+    seat: collectTools((s) => registerSeatTools(s, { apiBase: 'http://127.0.0.1:9' })),
+  };
+  const offenders = [];
+  for (const [surface, tools] of Object.entries(surfaces)) {
+    for (const [name, { def }] of tools) {
+      const title = def.title;
+      if (typeof title !== 'string' || title.length === 0) { offenders.push(`${surface}/${name}: no title`); continue; }
+      if (title.length > 40) offenders.push(`${surface}/${name}: "${title}" is over 40 chars`);
+      if (title.includes('_')) offenders.push(`${surface}/${name}: "${title}" carries an underscore`);
+      if (!/^[A-Z]/.test(title)) offenders.push(`${surface}/${name}: "${title}" does not start with a capital`);
+      // Sentence case: after the first word only acronyms may be capitalised.
+      const tail = title.split(' ').slice(1).filter((w) => /^[A-Z]/.test(w) && w !== w.toUpperCase());
+      if (tail.length) offenders.push(`${surface}/${name}: "${title}" is title case`);
+    }
+  }
+  assert.deepEqual(offenders, [], offenders.join('; '));
+  assert.ok(surfaces.owner.size >= 50, `owner surface has ${surfaces.owner.size} tools`);
+});

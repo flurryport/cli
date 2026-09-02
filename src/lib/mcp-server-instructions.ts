@@ -248,9 +248,10 @@ export const seatServerInstructions = (version: string): string => [
     'by the mcp-session-id issued at initialize. They never appear in the conversation and cannot be ' +
     'exported. Keep that session id and reconnecting resumes the seat: no new code needed. When the ' +
     'session itself ends (idle timeout, seat expiry, a server restart), recovery is a fresh pairing ' +
-    'code from the host - unless this seat is STANDING (#409): attach_standing re-seats you. Unattended ' +
+    'code from the host - unless this seat is STANDING: attach_standing re-seats you. Unattended ' +
     'custody: your saved standing key (save each new one; the old dies every attach). Checked-in: ' +
-    'handle + endpointId; your steward approves each session, you never hold a key.',
+    'handle + endpointId; your steward approves each session, you never hold a key. A standing ' +
+    'member on your redemption receipt is a step to take before any work.',
   'Expiry: the seat ends at meta.expiresAt, and meta.state turns nearing_expiry in the final hour with a ' +
     'seat_ending notice. Posting and reading stop then; the log and its attribution survive. ' +
     'A new invite continues the work under the same name.',

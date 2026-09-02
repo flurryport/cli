@@ -120,6 +120,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'get_capture_url',
     {
+      title: 'Get capture URL',
       description:
         "Return this anonymous session's live capture URL (paste into Stripe/GitHub/etc. as the webhook destination) " +
         'plus the browser viewer URL. CALL THIS FIRST. Use when the user mentions webhooks, webhook debugging, ' +
@@ -177,6 +178,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'list_captures',
     {
+      title: 'List captures',
       description:
         'List webhooks captured on this anonymous session, newest first. Poll this to see events as they arrive; ' +
         'it returns summaries only - call get_capture with an id for the full body. Rejected captures are flagged ' +
@@ -230,6 +232,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'get_capture_digest',
     {
+      title: 'Get capture digest',
       description:
         'Grouped digest of this session\'s captures: totals plus counts by event type, by provider, and by hour ' +
         '(facts only, never payloads). Use this INSTEAD of listing everything when the user asks "what came in", ' +
@@ -271,6 +274,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'register_watch',
     {
+      title: 'Register watch',
       description:
         'Register a watch on this anonymous session: a JSONata predicate over $body/$headers/$query, plus an ' +
         'optional label. IMPORTANT: this watch SLEEPS until the session is claimed - it is stored, validated, ' +
@@ -317,6 +321,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'list_watches',
     {
+      title: 'List watches',
       description:
         'List the dormant watches registered on this anonymous session (name, predicate, label). These sleep ' +
         'until the session is claimed - there is no match count or enabled state yet. Use after register_watch ' +
@@ -354,6 +359,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'read_pipe_manifest',
     {
+      title: 'Read pipe manifest',
       description:
         'Read .flurryport/pipes.json from the working directory: pipes this repo delivers through ' +
         '(recorded by a teammate or a previous session). If entries exist, this project is already wired to ' +
@@ -383,6 +389,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'get_capture',
     {
+      title: 'Get capture',
       description:
         'Fetch one captured webhook in full (headers, query string, body) by id from list_captures. ' +
         'Anonymous captures are PLAINTEXT on the server. The body is the raw provider payload. ' +
@@ -436,6 +443,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'forward_to_localhost',
     {
+      title: 'Forward to localhost',
       description:
         "Forward (replay) one captured webhook to a URL on the user's OWN machine, e.g. http://localhost:3000/webhook. " +
         'The CLI delivers it locally; the FlurryPORT server never makes this call. The full RAW payload and original ' +
@@ -545,6 +553,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'capture_count',
     {
+      title: 'Count captures',
       description:
         'Cheap progress check: accepted/rejected counts, remaining cap, and the per-minute burst window for this ' +
         'anonymous session. Use it while an external sender (stripe CLI, curl, a provider dashboard) is generating ' +
@@ -588,6 +597,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'send_test_event',
     {
+      title: 'Send test event',
       description:
         'Send provider-shaped TEST webhooks to this session\'s capture URL so the user can exercise the capture ' +
         'loop before their real provider is wired up. Bodies and headers are realistic enough to light up provider ' +
@@ -698,6 +708,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'start_echo_server',
     {
+      title: 'Start echo server',
       description:
         "Start (or reuse) a local echo receiver on the user's machine so replay can be proven before their real " +
         'backend exists: it answers 200 and mirrors the method, headers, and body back, so a forward_to_localhost ' +
@@ -731,6 +742,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'get_upgrade_options',
     {
+      title: 'Get upgrade options',
       description:
         'NOT for webhook debugging. Only call when the user asks about pricing, plan limits, upgrades, or ' +
         'hitting a usage cap. Live plan catalog and pricing from the FlurryPORT billing API: every tier with its limits, ' +
@@ -778,6 +790,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'request_secret_setup',
     {
+      title: 'Request secret setup',
       description:
         'Call this when a recipe you are wiring STORES A CREDENTIAL or DELIVERS EXTERNALLY - that needs a free ' +
         'FlurryPORT account (anonymous sessions never hold secrets). Prefer passing recipeRef alone. The ' +
@@ -846,6 +859,7 @@ export function registerAnonTools(server: McpServer, ctx: AnonToolContext): Regi
   registered.push(server.registerTool(
     'create_invite',
     {
+      title: 'Create invite',
       description:
         'Mint an invite link so ANOTHER PERSON (and their AI agent) can join this session - for example to ' +
         'play a game recipe or send events into the shared inbox. Returns inviteUrl: give it to your user to ' +

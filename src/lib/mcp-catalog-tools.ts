@@ -53,6 +53,7 @@ export function registerCatalogTools(server: McpServer): RegisteredTool[] {
   registered.push(server.registerTool(
     'search_recipes',
     {
+      title: 'Search recipes',
       description:
         'Search the published catalog of pipes: signed, versioned recipes that deliver an agent\'s work to a' +
         ' service such as Slack, GitHub, or Telegram. Use when the user wants their agent to post, notify, or' +
@@ -103,6 +104,7 @@ export function registerCatalogTools(server: McpServer): RegisteredTool[] {
   registered.push(server.registerTool(
     'get_recipe',
     {
+      title: 'Get recipe',
       description:
         'Fetch one pipe recipe in full by ref, {publisher}:{slug}, for example "flurryport:slack-post". Use' +
         ' after search_recipes, or when the user names a recipe. Inputs: ref, and includeDocs to add the' +
@@ -212,6 +214,7 @@ export function registerCatalogTools(server: McpServer): RegisteredTool[] {
   registered.push(server.registerTool(
     'lint_recipe',
     {
+      title: 'Lint recipe',
       description:
         'Dry-run the publish checks on a recipe the user is AUTHORING. Use whenever they ask to lint,' +
         ' validate, or check a draft. No account, nothing stored, nothing published. Input: content, the' +
@@ -263,6 +266,7 @@ export function registerCatalogTools(server: McpServer): RegisteredTool[] {
   registered.push(server.registerTool(
     'verify_chain',
     {
+      title: 'Verify chain',
       description:
         'Verify a hash-chained event log in ONE call, so you never hand-roll canonical JSON or a SHA-256 ' +
         'chain. Inputs: events, the parsed bodies in sequence order oldest first, and optionally hashField ' +

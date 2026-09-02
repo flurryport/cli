@@ -74,6 +74,21 @@ export interface SeatRelease {
   joinedAtCursor: string | null | undefined;
 }
 
+/** The redemption release proper: a SeatRelease plus the #478 standing facts. */
+export interface RedeemedRelease extends SeatRelease {
+  /**
+   * #478 standing facts. preAuthorized: the chair authorized this handle's standing
+   * slot, so the consent ceremony is the seat's first act. live: the handle's
+   * identity already holds an unexpired grant and the server re-opened the
+   * first-collection lane for this seat, so the seat token exchanges for the
+   * standing release right now. custody names that grant's custody. All false/null
+   * against an older server.
+   */
+  standingPreAuthorized: boolean;
+  standingLive: boolean;
+  standingCustody: string | null;
+}
+
 interface RedeemSeatWire {
   Token: string;
   SigningKey: string;
@@ -86,9 +101,12 @@ interface RedeemSeatWire {
   SeatRef: string;
   ExpiresAt: string;
   JoinedAtCursor?: string | null;
+  StandingPreAuthorized?: boolean;
+  StandingLive?: boolean;
+  StandingCustody?: string | null;
 }
 
-async function attemptRedeem(apiBase: string, code: string): Promise<SeatRelease> {
+async function attemptRedeem(apiBase: string, code: string): Promise<RedeemedRelease> {
   const canonical = canonicalizeCode(code);
   const handle = codeHandle(canonical);
   const nonce = randomBytes(16).toString('base64url');
@@ -119,6 +137,9 @@ async function attemptRedeem(apiBase: string, code: string): Promise<SeatRelease
     seatRef: wire.SeatRef,
     expiresAt: toUtcIso(wire.ExpiresAt),
     joinedAtCursor: 'JoinedAtCursor' in wire ? (wire.JoinedAtCursor ?? null) : undefined,
+    standingPreAuthorized: wire.StandingPreAuthorized === true,
+    standingLive: wire.StandingLive === true,
+    standingCustody: wire.StandingCustody ?? null,
   };
 }
 
@@ -128,7 +149,7 @@ async function attemptRedeem(apiBase: string, code: string): Promise<SeatRelease
  * clock-skew window - recomputing with a fresh timestamp is the server's own advice).
  * Every other failure surfaces as a typed SeatRedeemError for the tool to map.
  */
-export async function redeemSeatCode(apiBase: string, code: string): Promise<SeatRelease> {
+export async function redeemSeatCode(apiBase: string, code: string): Promise<RedeemedRelease> {
   try {
     return await attemptRedeem(apiBase, code);
   } catch (err) {

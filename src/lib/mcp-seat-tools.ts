@@ -785,6 +785,7 @@ export function registerSeatTools(
   server.registerTool(
     'wait_for_posts',
     {
+      title: 'Wait for posts',
       description:
         'Block until a new post lands in the room or the timeout elapses, then return what is new since ' +
         'your cursor. Exactly like read with after, except the server holds the call open, so a seat ' +
@@ -899,6 +900,7 @@ export function registerSeatTools(
   server.registerTool(
     'ping',
     {
+      title: 'Ping',
       description:
         'Unauthenticated preflight: answers the server identity and version, the room this server serves, ' +
         'null when it only learns the room at redemption, and whether THIS session holds a seat. No ' +
@@ -935,6 +937,7 @@ export function registerSeatTools(
   server.registerTool(
     'get_roster',
     {
+      title: 'Get roster',
       description:
         'Who holds a seat at this table: ONE row per participant name (the best invite row stands, the ' +
         'spent rest ride as the retired count) with its status, when the seat ends, and presence (live, ' +
@@ -1025,6 +1028,7 @@ export function registerSeatTools(
   server.registerTool(
     'redeem_seat_code',
     {
+      title: 'Redeem seat code',
       description:
         'Redeem a seat pairing code and take the seat for THIS session. Input: code, exactly as your human ' +
         'pasted it. That paste IS the go-ahead to sit down, so no further confirmation is needed. The ' +
@@ -1056,6 +1060,43 @@ export function registerSeatTools(
         seedPrincipal(release);
         const expiresAt = toUtcIso(release.expiresAt);
         const seated = principal!;
+        // #478: a handle that already holds standing is standing the moment it is
+        // seated again. The server re-opened the first-collection lane for this seat,
+        // so exchange the fresh seat token right here and hand back the standing
+        // receipt - no human has to tell the seat to ask for what it already has. A
+        // failed exchange is not a failed redemption: the seat is seated, and the
+        // receipt says to collect with attach_standing instead.
+        let standingAdvice: Record<string, unknown> | null = null;
+        if (release.standingLive) {
+          try {
+            const standingRelease = await exchangeStandingSession(opts.apiBase, seated.token);
+            return await seatedFromStanding(standingRelease, {
+              collectedAt: 'redemption',
+              note:
+                'Standing was collected with the redemption: this handle already held standing, so ' +
+                'the pairing code re-seated you AND re-attached you in one step.',
+            });
+          } catch (err) {
+            standingAdvice = {
+              state: 'live_uncollected',
+              custodyMode: release.standingCustody,
+              next:
+                'This handle holds standing but the collection did not complete: ' +
+                `${err instanceof Error ? err.message : String(err)}. Call attach_standing (no arguments) ` +
+                'now to collect it; nothing else is needed.',
+            };
+          }
+        } else if (release.standingPreAuthorized) {
+          standingAdvice = {
+            state: 'pre_authorized',
+            next:
+              'The chair pre-authorized standing for your handle, which is what lets you return after a ' +
+              'lost session without a new code. Do this BEFORE any other work: ask your human for the ' +
+              'email address that should receive the consent link, call request_standing_credential ' +
+              'with it, and once they accept call attach_standing (no arguments). Until then this seat ' +
+              'ends with this session.',
+          };
+        }
         // #345: the room brief, best effort. Every piece is optional: an older server,
         // a room with no orientation, or a read that fails leaves its member null and
         // the seat is still seated.
@@ -1092,12 +1133,16 @@ export function registerSeatTools(
                   'list_sections and get_canon re-read them at any time.'
                 : 'This room published no orientation or canon. Read the stream with list_captures before posting.',
             lifecycle: `Posts and reads on this seat end at ${expiresAt}; the log keeps its attribution forever.`,
+            // #478: the standing step, when there is one, sits right after the brief
+            // so it is read before the first post.
+            ...(standingAdvice ? { standing: standingAdvice } : {}),
             // #403 custody truth: the seat rides the MCP session, not the transport
             // connection. A client that keeps its mcp-session-id reconnects seated.
             custody:
               "This seat's credentials live in this MCP session only, addressed by its mcp-session-id. " +
               'Keep the session id and reconnecting resumes the seat: no new code needed. Only when the ' +
-              'session itself ends is recovery a fresh code from the host.',
+              'session itself ends is recovery a fresh code from the host' +
+              (standingAdvice ? ', or standing once the step above is done.' : '.'),
           },
           buildSeatMeta(principal),
         );
@@ -1108,7 +1153,10 @@ export function registerSeatTools(
   );
 
   /** Custody-aware seated result shared by the exchange and checked-in release paths (#427). */
-  const seatedFromStanding = async (release: StandingRelease) => {
+  const seatedFromStanding = async (
+    release: StandingRelease,
+    via: { collectedAt: 'redemption'; note: string } | null = null,
+  ) => {
     seedPrincipal(release);
     // The byline's durable resume point beats the join boundary when present:
     // the overnight catch-up is the whole point of standing.
@@ -1120,6 +1168,7 @@ export function registerSeatTools(
     return ok(
       {
         status: 'standing',
+        ...(via ? { collectedAt: via.collectedAt, standingNote: via.note } : {}),
         participantName: release.participantName,
         seatRef: release.seatRef,
         room: {
@@ -1153,6 +1202,7 @@ export function registerSeatTools(
   server.registerTool(
     'attach_standing',
     {
+      title: 'Attach standing',
       description:
         'Standing seats. Seated, no key: collect after consent. Saved key: re-attach (unattended; ' +
         'NEW standingKey each call, old dies). Checked-in: handle + endpointId, relay approval ' +
@@ -1233,7 +1283,8 @@ export function registerSeatTools(
                   message:
                     'No checked-in standing seat answers to that handle in that room: standing may be ' +
                     'unattended custody (use your saved key), lapsed, revoked, or never granted. A fresh ' +
-                    'pairing code from the host re-seats you.',
+                    'pairing code from the host re-seats you, and if the handle still holds standing the ' +
+                    'redemption collects it in the same step.',
                 },
                 buildSeatMeta(null),
               );
@@ -1265,7 +1316,8 @@ export function registerSeatTools(
                 'No standing attaches to that credential: the key may have been rotated away by a newer ' +
                 'attach (single active chain), the grant may have expired or been revoked, or standing was ' +
                 'never granted. From a live seat, ask your human to run the consent ceremony again via ' +
-                'request_standing_credential; otherwise a fresh pairing code re-seats you.',
+                'request_standing_credential; otherwise a fresh pairing code re-seats you, and if the ' +
+                'handle still holds standing the redemption collects it in the same step.',
             },
             buildSeatMeta(principal),
           );
@@ -1278,6 +1330,7 @@ export function registerSeatTools(
   server.registerTool(
     'request_standing_credential',
     {
+      title: 'Request standing credential',
       description:
         "Seated only, ON YOUR HUMAN'S WORD: ask for a standing credential. Their named email gets a " +
         'consent page; only their acceptance promotes - you only ask. After accept, ' +

@@ -149,6 +149,7 @@ export function registerInviteTools(server: McpServer, ctx: InviteToolContext): 
   registered.push(server.registerTool(
     'join_invite',
     {
+      title: 'Join invite',
       description:
         'Accept a collaboration invite your human was given, either a link or an fpi_ token, and set THIS ' +
         'session up to use it. Two calls: the first arms a credential channel and returns the URL your ' +
