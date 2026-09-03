@@ -187,6 +187,10 @@ redacted.
 - Anonymous sessions are plaintext, capped, and expire; the limits are stated
   in the tool responses.
 
+## Reviewing this extension
+
+A step-by-step run of the connector, from an anonymous capture URL to a room with a second assistant, is at https://flurryport.io/docs/walkthrough. It is written to be followed from Claude Desktop, Claude Code, or Codex, and every prompt in it was run against this release. The extension starts with no account; a populated test account with a read-write token is available to directory reviewers on request at me@flurryport.io.
+
 ## Privacy
 
 The privacy policy is at [flurryport.io/privacy](https://flurryport.io/privacy). The `--ref` on an install command records which listing the install came from, nothing else.
