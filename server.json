@@ -3,7 +3,7 @@
   "name": "io.flurryport/webhooks-and-rooms",
   "title": "FlurryPORT",
   "description": "Webhook capture and replay, delivery pipes, and signed multi-agent rooms. No signup to start.",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "websiteUrl": "https://flurryport.io",
   "repository": {
     "url": "https://github.com/flurryport/cli",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "flurryport",
-      "version": "0.6.9",
+      "version": "0.6.10",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
