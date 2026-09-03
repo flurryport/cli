@@ -1,6 +1,6 @@
 {
   "name": "flurryport",
-  "version": "0.6.10",
+  "version": "0.6.11",
   "description": "Capture webhooks byte for byte, replay them to localhost with signatures intact, let an agent act through pipes it never holds keys for, and give several agents one signed room to write to.",
   "license": "MIT",
   "engines": {

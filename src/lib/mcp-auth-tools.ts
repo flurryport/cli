@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isLocalTarget } from './local-target.js';
 import { generateSigningKey, putCredential, signingKeyRef } from './keystore.js';
 import { chooseIntentKey, deliverIntent } from './intent-post.js';
 import { manifestPath, readManifest, removeManifestEntry, upsertManifestEntry } from './pipe-manifest.js';
@@ -1102,13 +1103,36 @@ scopeFailure(ctx, 'endpoint'),
     (a) => `/api/v1/projects/${a.projectId}/replay-executions?skip=${a.skip ?? 0}&take=${a.take ?? 20}`,
     (a) => a.projectId as string);
 
-  read(server, ctx, 'get_replay_execution',
-    'One replay execution in detail, including the response body. Inputs: projectId, executionId. The ' +
-    'body is full when the plan includes FullResponseBody, otherwise a 4KB preview, so check ' +
-    'ResponseBodyTruncated before parsing.',
-    { projectId: id, executionId: id },
-    (a) => `/api/v1/projects/${a.projectId}/replay-executions/${a.executionId}`,
-    (a) => a.projectId as string);
+  server.registerTool(
+    'get_replay_execution',
+    {
+      title: toolTitle('get_replay_execution'),
+      description:
+        'One replay execution in detail, including the response body. Inputs: projectId, executionId. The ' +
+        'body is full when the plan includes FullResponseBody, otherwise a 4KB preview, so check ' +
+        'ResponseBodyTruncated before parsing. A "No CLI connected" failure carries the listener steps.',
+      inputSchema: { projectId: id, executionId: id },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async (a: Record<string, unknown>) => {
+      const plan = await getPlan(ctx, a.projectId as string);
+      try {
+        const result = opaqueIds(
+          await ctx.client.get(`/api/v1/projects/${a.projectId}/replay-executions/${a.executionId}`),
+        ) as Record<string, unknown>;
+        const error = typeof result.Error === 'string' ? result.Error : '';
+        if (/no cli connected/i.test(error)) {
+          return ok(
+            { ...result, hint: LOCAL_LISTENER_HINT, steps: LOCAL_LISTENER_STEPS },
+            authMeta(ctx, plan),
+          );
+        }
+        return ok(result, authMeta(ctx, plan));
+      } catch (err) {
+        return mapAuthError(ctx, err, plan);
+      }
+    },
+  );
 
   read(server, ctx, 'list_replay_targets',
     "An endpoint's replay targets. Inputs: projectId, endpointId. Targets are the ONLY destinations " +
@@ -1789,6 +1813,18 @@ scopeFailure(ctx, 'endpoint'),
     },
   );
 
+  // #485: local-class targets are delivered by a `flurryport listen` session, which
+  // this server does not run. Name the steps instead of queueing a doomed execution.
+  const LOCAL_LISTENER_HINT =
+    'This target resolves to a local or private address. Local delivery is carried by a ' +
+    '`flurryport listen` session in a terminal on the machine that owns that address, which this ' +
+    'server does not run, so a queued replay fails with "No CLI connected". forward_to_localhost ' +
+    'delivers a capture to localhost from here with no listener at all.';
+  const LOCAL_LISTENER_STEPS = [
+    'Open a terminal and run: npx flurryport login   (it prints an approval link to open in the browser; no token is pasted anywhere)',
+    'Run: npx flurryport listen   (it attaches to the local target, creating one if none exists; leave that window open)',
+    'Replay again, with allowLocal: true.',
+  ];
   server.registerTool(
     'replay_to_target',
     {
@@ -1802,17 +1838,41 @@ scopeFailure(ctx, 'endpoint'),
         'get_capture_executions instead, and reach for manual replay only when auto-forward did not apply. ' +
         'Read-write token; the default is read-only and this answers forbidden with the setup walkthrough ' +
         'to relay. Delivery is queued, so poll get_replay_execution for the outcome, and pass the returned ' +
-        'idempotencyKey back on a retry so it cannot double-deliver.',
+        'idempotencyKey back on a retry so it cannot double-deliver. With projectId and endpointId a ' +
+        'local-address target is refused up front with the listener steps; allowLocal skips that guard.',
       inputSchema: {
         captureId: id,
         targetId: id,
+        projectId: id.optional().describe('Enables the local-address guard with endpointId.'),
+        endpointId: id.optional().describe('Enables the local-address guard with projectId.'),
+        allowLocal: z.boolean().optional().describe('Queue to a local target anyway (flurryport listen is attached).'),
         idempotencyKey: z.string().max(64).optional()
           .describe('Dedup key. Omit on first call (one is generated and returned); pass it back verbatim when retrying.'),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
-    async ({ captureId, targetId, idempotencyKey }) => {
+    async ({ captureId, targetId, idempotencyKey, projectId, endpointId, allowLocal }) => {
       const plan = await anyCachedPlan(ctx);
+      // #485: refuse a local-class target before the queue does, with the steps named.
+      if (projectId && endpointId && allowLocal !== true) {
+        try {
+          const target = (await ctx.client.get(
+            `/api/v1/projects/${projectId}/endpoints/${endpointId}/replay-targets/${targetId}`,
+          )) as { BaseUrl?: string; Name?: string };
+          if (typeof target.BaseUrl === 'string' && (await isLocalTarget(target.BaseUrl))) {
+            return fail(
+              {
+                code: 'local_listener_required',
+                message: `Target ${target.Name ?? targetId} (${target.BaseUrl}) was not queued. ${LOCAL_LISTENER_HINT}`,
+                hint: `Steps for the human: ${LOCAL_LISTENER_STEPS.join(' ')} Or call forward_to_localhost with the same captureId to deliver it to localhost right now.`,
+              },
+              authMeta(ctx, plan),
+            );
+          }
+        } catch {
+          /* best effort: the enqueue path answers for real */
+        }
+      }
       // The enqueue body takes RAW GUIDs; the model holds opaque base62 ids.
       let captureGuid: string, targetGuid: string;
       try {

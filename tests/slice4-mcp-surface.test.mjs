@@ -293,7 +293,9 @@ const BUDGET = {
   // and made revoke_invite's description tell the truth about redeemed seats
   // (it always unseated them; the old text denied it and sent humans to the web
   // UI). Both texts are at their lean form.
-  ownerToolsListChars: 76_300,
+  // 0.6.11: +700 for the replay_to_target local-listener guard inputs and the
+  // get_replay_execution listener note (#485). Deliberate, not drift.
+  ownerToolsListChars: 77_000,
   // Raised 2026-08-26 for ruled contract text, after trimming: the rooms bash put
   // forSections (#411), checkOnly + the oversize warning (#405), the body
   // string-or-object union (#405), and the deduped roster (#409) on the seat

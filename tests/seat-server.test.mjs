@@ -446,6 +446,10 @@ test('seat server over streamable HTTP: ceremony, custody, signing, and session 
     // relays it verbatim, and no client-side read happens at all (the race window
     // between redeeming and reading is exactly what the server issuance closes).
     assert.equal(seated.joinedAtCursor, 'jc-boundary');
+    // #486: the cursor is exclusive of the newest row at redemption, so the brief
+    // says where orders posted between the mint and this redemption live.
+    assert.match(seated.firstRead, /NO after/);
+    assert.match(seated.firstRead, /addressedToMe:true/);
     assert.equal(state.reads.filter((r) => r.url.includes('/captured-requests?')).length, 0,
       'redemption must not trigger any client-side capture read');
     assert.match(seated.lifecycle, /attribution/);

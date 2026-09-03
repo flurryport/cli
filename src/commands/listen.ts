@@ -99,12 +99,65 @@ async function discoverTargets(api: ReturnType<typeof createApiClient>): Promise
   return choices;
 }
 
-async function selectTarget(choices: TargetChoice[]): Promise<TargetChoice> {
-  if (choices.length === 0) {
-    console.error(chalk.red('No localhost replay targets found.'));
-    console.error(chalk.dim('Create a replay target pointing at localhost in the FlurryPORT UI first.'));
+/** Numbered pick, auto-selected when there is exactly one. */
+async function pick<T>(label: string, items: T[], render: (item: T) => string): Promise<T> {
+  if (items.length === 1) {
+    console.log(chalk.dim(`${label}: ${render(items[0])}`));
+    return items[0];
+  }
+  console.log(chalk.bold(`${label}:`));
+  items.forEach((item, i) => console.log(`  ${chalk.bold(String(i + 1))}. ${render(item)}`));
+  const answer = await prompt(`Choose (1-${items.length}): `);
+  const idx = parseInt(answer, 10) - 1;
+  if (!(idx >= 0 && idx < items.length)) {
+    console.error(chalk.red('Invalid selection.'));
     process.exit(1);
   }
+  return items[idx];
+}
+
+/**
+ * #485: no localhost target yet is the common first run, not an error. Walk the
+ * user through creating one here (project, endpoint, local URL) and attach to it,
+ * instead of sending them to the web app and back.
+ */
+async function createLocalTarget(api: ReturnType<typeof createApiClient>): Promise<TargetChoice> {
+  if (!process.stdin.isTTY) {
+    console.error(chalk.red('No localhost replay targets found.'));
+    console.error(chalk.dim('Run `flurryport listen` in an interactive terminal to create one, or create a replay target pointing at localhost in the FlurryPORT UI.'));
+    process.exit(1);
+  }
+  console.log(chalk.bold('No localhost replay targets yet. Creating one.\n'));
+  const projects = ((await api.get('/api/v1/projects')).Projects ?? []) as Project[];
+  if (projects.length === 0) {
+    console.error(chalk.red('This account has no projects. Create one in the FlurryPORT web app first.'));
+    process.exit(1);
+  }
+  const project = await pick('Project', projects, (p) => p.Slug);
+  const endpoints = ((await api.get(`/api/v1/projects/${guidToBase62(project.Id)}/endpoints`)).Endpoints ?? []) as Endpoint[];
+  if (endpoints.length === 0) {
+    console.error(chalk.red(`Project ${project.Slug} has no endpoints. Create one first (create_endpoint from the connector, or the web app).`));
+    process.exit(1);
+  }
+  const endpoint = await pick('Endpoint', endpoints, (e) => e.Slug);
+  const urlAnswer = await prompt('Local URL [http://localhost:4242/]: ');
+  const baseUrl = urlAnswer || 'http://localhost:4242/';
+  if (!(await isLocalTarget(baseUrl))) {
+    console.error(chalk.red(`${baseUrl} is not a local address. listen only serves localhost targets; public targets are delivered server-side.`));
+    process.exit(1);
+  }
+  const nameAnswer = await prompt('Target name [Local]: ');
+  const created = await api.post(
+    `/api/v1/projects/${guidToBase62(project.Id)}/endpoints/${guidToBase62(endpoint.Id)}/replay-targets`,
+    { Name: nameAnswer || 'Local', BaseUrl: baseUrl, AutoReplay: false },
+  );
+  const target = created as unknown as ReplayTarget;
+  console.log(chalk.green(`\nCreated ${target.Name || nameAnswer || 'Local'} -> ${baseUrl} on ${project.Slug}/${endpoint.Slug}\n`));
+  return { target, project, endpoint };
+}
+
+async function selectTarget(choices: TargetChoice[], api: ReturnType<typeof createApiClient>): Promise<TargetChoice> {
+  if (choices.length === 0) return createLocalTarget(api);
 
   if (choices.length === 1) {
     console.clear();
@@ -240,7 +293,7 @@ export const listenCommand = new Command('listen')
 
     console.log(chalk.dim('Discovering localhost replay targets...\n'));
     const choices = await discoverTargets(api);
-    const chosen = await selectTarget(choices);
+    const chosen = await selectTarget(choices, api);
 
     const { target, project, endpoint } = chosen;
 
