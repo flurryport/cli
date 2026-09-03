@@ -79,12 +79,28 @@ const manifest = {
   privacy_policies: ['https://flurryport.io/privacy'],
   license: pkg.license,
   keywords: pkg.keywords,
+  // #479 / Codex reviewer run 2026-09-02: a Desktop reviewer has no terminal step,
+  // so the optional write token is an extension setting (sensitive, stored by
+  // Desktop's keychain) injected as FLURRYPORT_TOKEN, the env the CLI already reads.
+  // Left blank the server starts anonymous exactly as before.
+  user_config: {
+    token: {
+      type: 'string',
+      title: 'Personal access token (optional)',
+      description:
+        'Leave blank to start without an account. To let the agent create endpoints and replay, ' +
+        'generate a token on flurryport.io/settings with Read-only unchecked and paste it here.',
+      sensitive: true,
+      required: false,
+    },
+  },
   server: {
     type: 'node',
     entry_point: 'server/dist/index.js',
     mcp_config: {
       command: 'node',
       args: ['${__dirname}/server/dist/index.js', 'mcp', ...(ref ? ['--ref', ref] : [])],
+      env: { FLURRYPORT_TOKEN: '${user_config.token}' },
     },
   },
 };

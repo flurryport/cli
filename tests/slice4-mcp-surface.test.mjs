@@ -456,7 +456,7 @@ test('every tool on every surface carries a sentence-case title (#479)', () => {
       if (title.includes('_')) offenders.push(`${surface}/${name}: "${title}" carries an underscore`);
       if (!/^[A-Z]/.test(title)) offenders.push(`${surface}/${name}: "${title}" does not start with a capital`);
       // Sentence case: after the first word only acronyms may be capitalised.
-      const tail = title.split(' ').slice(1).filter((w) => /^[A-Z]/.test(w) && w !== w.toUpperCase());
+      const tail = title.split(' ').slice(1).filter((w) => /^[A-Z]/.test(w) && w !== w.toUpperCase() && w !== 'FlurryPORT');
       if (tail.length) offenders.push(`${surface}/${name}: "${title}" is title case`);
     }
   }

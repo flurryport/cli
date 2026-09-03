@@ -57,8 +57,10 @@ const ROOMS_SURFACE =
   'create_invite, and keeps rulings with create_collection, add_to_collection, and replace_collection_item. ' +
   'Everyone at the table reads what already stands with get_canon and list_sections, speaks with ' +
   'post_intent, reads the stream with list_captures, and waits for the next post with wait_for_captures. ' +
-  'list_members, revoke_invite, and revoke_member run the roster. Posts are signed per participant, so ' +
-  'attribution comes from the key rather than from the from member anyone can type.';
+  'list_members, revoke_invite, and revoke_member run the roster. After minting a seat, hold the room ' +
+  'with wait_for_captures: the first post from the guest is addressed to you and nobody prompts you to look. ' +
+  'Posts are signed per participant, so attribution comes from the key rather than from the from member ' +
+  'anyone can type.';
 
 const CAPTURE_ONRAMP = [
   'WEBHOOK CAPTURE is the free way in and the same stream underneath: point a provider at an endpoint and ' +

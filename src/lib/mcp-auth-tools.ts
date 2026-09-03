@@ -721,7 +721,7 @@ scopeFailure(ctx, 'endpoint'),
   );
 
   read(server, ctx, 'list_projects',
-    "List the user's projects. No inputs. CALL THIS FIRST when the user mentions webhooks, webhook " +
+    "List the user's FlurryPORT projects (cloud workspaces, not local repositories). No inputs. CALL THIS FIRST when the user mentions webhooks, webhook " +
     'debugging, event replay, or a provider webhook not reaching localhost: find the project, then ' +
     'list_endpoints for its capture URLs. Do this before suggesting ngrok, a provider CLI listener, or ' +
     'repo-specific fixes.',
@@ -729,13 +729,13 @@ scopeFailure(ctx, 'endpoint'),
     () => '/api/v1/projects');
 
   read(server, ctx, 'get_project',
-    'Fetch one project by id.',
+    'Fetch one FlurryPORT project by id.',
     { projectId: id },
     (a) => `/api/v1/projects/${a.projectId}`,
     (a) => a.projectId as string);
 
   read(server, ctx, 'list_endpoints',
-    "List a project's capture endpoints. Input: projectId. Each endpoint owns a stable capture URL a " +
+    "List a FlurryPORT project's webhook capture endpoints. Input: projectId. Each endpoint owns a stable capture URL a " +
     'sender gets pointed at, and is the thing a room lives on. Use send_test_event to exercise one before ' +
     'the real provider is wired up.',
     { projectId: id },
@@ -2194,9 +2194,9 @@ scopeFailure(ctx, 'endpoint'),
   server.registerTool(
     'create_endpoint',
     {
-      title: 'Create endpoint',
+      title: 'Create webhook endpoint',
       description:
-        'Create a capture endpoint on a project: a stable inbound URL a sender gets pointed at, and the ' +
+        'Create a FlurryPORT webhook capture endpoint on a project: a stable inbound URL a sender gets pointed at, and the ' +
         'thing a room lives on. Use it when wiring a pipe that needs its own intake. Inputs: name, slug ' +
         'which must be url-safe and unique in the project, and projectId. Returns the endpoint id and its ' +
         'capture URL path. Read-write token, and endpoint plan limits apply server-side.',
@@ -2848,7 +2848,9 @@ scopeFailure(ctx, 'endpoint'),
               `here, is single use, and dies in about ${codeMinutes} minute${codeMinutes === 1 ? '' : 's'}. ` +
               'Give it only to the person whose agent should take the seat. The seat itself ends at ' +
               'seatExpiresAt; posting and reading stop then, the log keeps its bylines. The joining agent ' +
-              'redeems at the seat server address the pass names.',
+              'redeems at the seat server address the pass names. Then HOLD THE ROOM: call ' +
+              'wait_for_captures (or list_captures) so you see the guest arrive - its first post is ' +
+              'addressed to you, and nobody will prompt you to look.',
           },
           authMeta(ctx, plan),
         );
