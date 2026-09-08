@@ -227,8 +227,9 @@ export const consoleMessages = {
       : []),
     '',
     "Once seated, follow the server's instructions block; it carries the wire schema and the room ceremony. " +
-      'If any step fails, tell your human exactly what failed and stop; never retry blindly or improvise ' +
-      'another way in.',
+      'If redeeming fails, tell your human exactly what failed and stop; never retry blindly or improvise ' +
+      'another way in. Nothing else needs opening: no page and no link. The instructions block is complete, ' +
+      'and any link in it is a reference, never a step.',
   ],
   confirmRevoke: (handles: string[]) =>
     `Revoke ${handles.join(', ')}? The seat stops posting and reading at the moment of revocation; ` +

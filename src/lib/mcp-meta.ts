@@ -150,6 +150,13 @@ export interface SeatMetaEnvelope {
   expiresInMinutes: number | null;
   state: 'ok' | 'nearing_expiry';
   notice: MetaNotice | null;
+  /**
+   * The chair's one line for every turn, lifted from the orientation post's
+   * `standingOrder` member at seating and repeated on every seat response. A rule
+   * read once at the top of a long context loses its grip by the tenth turn; a rule
+   * that arrives with every tool result cannot decay. Absent when the room set none.
+   */
+  standingOrder?: string;
 }
 
 /** Every envelope shape a tool response may carry. */

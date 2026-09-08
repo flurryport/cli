@@ -3490,7 +3490,9 @@ scopeFailure(ctx, 'endpoint'),
         'from get_endpoint OrientationCaptureId then get_capture. sections and roster come back from ' +
         'list_sections, get_canon, and get_endpoint, so a reader never parses the orientation post. Pass ' +
         'clear true with no captureId to release the orientation, or sections or roster alone to edit the ' +
-        'map without moving it. Omitting one leaves it as it is; an empty array clears it.',
+        'map without moving it. Omitting one leaves it as it is; an empty array clears it. A string ' +
+        'member standingOrder (one line, 240 chars) in the orientation post rides meta.standingOrder ' +
+        'on every seat response: the one rule a seat cannot lose as its context grows.',
       inputSchema: {
         projectId: z.string().optional().describe('Opaque project id; omit to use the claimed or only project.'),
         endpointId: z.string().optional().describe('Opaque endpoint id; omit to use the claimed or only endpoint.'),

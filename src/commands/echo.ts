@@ -20,19 +20,45 @@ import chalk from 'chalk';
  * `X-Api-Key: $secrets.STRIPE_KEY` and the recorded response shows
  * `X-Echo-X-Api-Key: [REDACTED:STRIPE_KEY]`.
  */
+/**
+ * `flurryport echo <port | url>`: the positional may be a bare port or the same address the
+ * listener takes (http://localhost:8765/hook). A URL supplies the port, the host to bind, and
+ * the path to answer on; explicit --host / --path still win. Exported for the test.
+ */
+export function parseEchoAddress(arg: string): { port: number; host?: string; path?: string } | null {
+  const trimmed = arg.trim();
+  if (/^[0-9]+$/.test(trimmed)) {
+    const port = parseInt(trimmed, 10);
+    return Number.isNaN(port) ? null : { port };
+  }
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  const port = url.port ? parseInt(url.port, 10) : url.protocol === 'https:' ? 443 : 80;
+  const path = url.pathname && url.pathname !== '/' ? url.pathname : undefined;
+  return { port, host: url.hostname, path };
+}
+
 export const echoCommand = new Command('echo')
   .description('Local HTTP receiver that 200s, logs, and mirrors every request header + body back - pair with `listen` to dogfood a bridge without a backend')
-  .argument('[port]', 'Port to listen on (default: 3000)', '3000')
-  .option('--host <host>', 'Interface to bind on. Defaults to localhost (whichever of 127.0.0.1 / ::1 your OS resolver returns). Pass 127.0.0.1, ::1, 127.0.0.5, 0.0.0.0, etc. to bind a specific address.', 'localhost')
+  .argument('[port]', 'Port to listen on, or the full local address the listener will forward to, e.g. http://localhost:8765/hook (default: 3000)', '3000')
+  .option('--host <host>', 'Interface to bind on. Defaults to localhost (whichever of 127.0.0.1 / ::1 your OS resolver returns). Pass 127.0.0.1, ::1, 127.0.0.5, 0.0.0.0, etc. to bind a specific address.')
   .option('--path <path>', 'Only respond 200 on this path; other paths return 404. Default: respond 200 on every path.')
-  .action((portArg: string, opts: { host: string; path?: string }) => {
-    const port = parseInt(portArg, 10);
-    if (Number.isNaN(port) || port < 1 || port > 65535) {
-      console.error(chalk.red(`Invalid port: ${portArg}`));
+  .action((portArg: string, opts: { host?: string; path?: string }) => {
+    const parsed = parseEchoAddress(portArg);
+    const port = parsed?.port ?? NaN;
+    if (!parsed || Number.isNaN(port) || port < 1 || port > 65535) {
+      console.error(chalk.red(`Invalid port or address: ${portArg}`));
       process.exit(1);
     }
-    const host = opts.host;
-    const filterPath = opts.path && !opts.path.startsWith('/') ? `/${opts.path}` : opts.path;
+    // An explicit flag wins; a URL fills in what the flags left unset.
+    const host = opts.host ?? parsed.host ?? 'localhost';
+    const pathOpt = opts.path ?? parsed.path;
+    const filterPath = pathOpt && !pathOpt.startsWith('/') ? `/${pathOpt}` : pathOpt;
 
     let count = 0;
     const server = http.createServer((req, res) => {

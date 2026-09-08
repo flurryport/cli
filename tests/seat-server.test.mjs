@@ -158,6 +158,7 @@ function startFakeApi() {
     briefs: [],            // {url} for the #345 room-brief reads at redemption
     inviteItems: null,     // override for the roster dedupe coverage (#409)
     orientationCaptureId: CAP_GUID, // null emulates a room with no orientation
+    orientationBody: '{"hello":true}', // the locked capture's text; override to carry a standingOrder
     canonRecap: 'Plain words, no hype.',
     betaStaleServed: false,
     standing: null,        // #478: extra members merged into alpha's redemption release
@@ -323,8 +324,8 @@ function startFakeApi() {
         return json(200, {
           Id: CAP_GUID, EndpointId: 'EPSEAT', HttpMethod: 'POST',
           Headers: JSON.stringify({ 'content-type': ['application/json'] }),
-          QueryString: null, BodyBytes: Buffer.from('{"hello":true}', 'utf8').toString('base64'),
-          ContentType: 'application/json', ContentLength: 14,
+          QueryString: null, BodyBytes: Buffer.from(state.orientationBody, 'utf8').toString('base64'),
+          ContentType: 'application/json', ContentLength: Buffer.byteLength(state.orientationBody, 'utf8'),
           RejectionReason: null, CreatedAt: new Date().toISOString(),
         });
       }
@@ -1252,6 +1253,50 @@ test('redeem_seat_code hands the seat the orientation and the canon, with the id
     assert.ok(!text.includes('fp_seat_alpha') && !text.includes('seat-key-alpha'), 'custody holds');
   } finally {
     srv.close();
+  }
+});
+
+test('the orientation\'s standingOrder rides the meta of every seat response, sanitized and capped', async () => {
+  const { srv, state, base: apiBase } = await startFakeApi();
+  // Untrusted body: a control character and runs of whitespace go; the line survives.
+  state.orientationBody = JSON.stringify({ hello: true, standingOrder: 'Render: under 120 words,\u0007 then   the block.  ' });
+  try {
+    const tools = collectTools((s) => registerSeatTools(s, { apiBase }));
+    const seated = JSON.parse((await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal(seated.status, 'seated', JSON.stringify(seated));
+    assert.equal(seated.meta.standingOrder, 'Render: under 120 words, then the block.', 'the receipt carries it');
+    const read = JSON.parse((await tools.get('read').handler({})).content[0].text);
+    assert.equal(read.meta.standingOrder, 'Render: under 120 words, then the block.', 'and so does every later response');
+  } finally {
+    srv.close();
+  }
+});
+
+test('a standingOrder that is missing, not a string, or overlong is absent or capped', async () => {
+  const { srv, state, base: apiBase } = await startFakeApi();
+  try {
+    let tools = collectTools((s) => registerSeatTools(s, { apiBase }));
+    let seated = JSON.parse((await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal(seated.meta.standingOrder, undefined, 'the default body has none');
+    srv.close();
+  } finally { /* re-opened below */ }
+  const second = await startFakeApi();
+  second.state.orientationBody = JSON.stringify({ standingOrder: ['not', 'a', 'string'] });
+  try {
+    const tools = collectTools((s) => registerSeatTools(s, { apiBase: second.base }));
+    const seated = JSON.parse((await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal(seated.meta.standingOrder, undefined, 'wrong type is ignored');
+  } finally {
+    second.srv.close();
+  }
+  const third = await startFakeApi();
+  third.state.orientationBody = JSON.stringify({ standingOrder: 'x'.repeat(500) });
+  try {
+    const tools = collectTools((s) => registerSeatTools(s, { apiBase: third.base }));
+    const seated = JSON.parse((await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal(seated.meta.standingOrder.length, 240, 'one line, not a card');
+  } finally {
+    third.srv.close();
   }
 });
 

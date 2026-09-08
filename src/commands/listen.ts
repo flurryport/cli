@@ -156,7 +156,47 @@ async function createLocalTarget(api: ReturnType<typeof createApiClient>): Promi
   return { target, project, endpoint };
 }
 
-async function selectTarget(choices: TargetChoice[], api: ReturnType<typeof createApiClient>): Promise<TargetChoice> {
+/**
+ * `flurryport listen <url>`: pick the local target whose BaseUrl is that address, so a script
+ * (or a docs page) can attach without answering the menu. Matching ignores case, a trailing
+ * slash, and a default port; nothing else, so http://localhost:8771/hook never matches
+ * http://localhost:8771/other. Returns every choice at that address (one per endpoint that
+ * has such a target); the caller narrows further only when there is more than one.
+ */
+export function matchTargetsByUrl<T extends { target: { BaseUrl: string } }>(choices: T[], url: string): T[] {
+  const norm = (u: string): string => {
+    try {
+      const parsed = new URL(u.trim());
+      const path = parsed.pathname.replace(/\/+$/, '') || '/';
+      return `${parsed.protocol}//${parsed.host.toLowerCase()}${path}${parsed.search}`;
+    } catch {
+      return u.trim().replace(/\/+$/, '').toLowerCase();
+    }
+  };
+  const wanted = norm(url);
+  return choices.filter((c) => norm(c.target.BaseUrl) === wanted);
+}
+
+async function selectTarget(choices: TargetChoice[], api: ReturnType<typeof createApiClient>, url?: string): Promise<TargetChoice> {
+  if (url) {
+    const matches = matchTargetsByUrl(choices, url);
+    if (matches.length === 0) {
+      console.error(chalk.red(`No localhost replay target at ${url}.`));
+      if (choices.length > 0) {
+        console.error(chalk.dim('Known local targets:'));
+        choices.forEach((c) => console.error(chalk.dim(`  ${c.target.BaseUrl}  (${c.project.Slug}/${c.endpoint.Slug} - ${c.target.Name})`)));
+      }
+      console.error(chalk.dim('Create one with create_replay_target (or `flurryport listen` with no URL), then run this again.'));
+      process.exit(1);
+    }
+    if (matches.length === 1) {
+      const c = matches[0];
+      console.log(chalk.dim(`Attached by URL: ${c.target.BaseUrl} (${c.project.Slug}/${c.endpoint.Slug})`));
+      return c;
+    }
+    // The same local address on more than one endpoint: fall through to the menu, narrowed.
+    choices = matches;
+  }
   if (choices.length === 0) return createLocalTarget(api);
 
   if (choices.length === 1) {
@@ -273,12 +313,13 @@ export async function forwardCapture(capture: CapturedRequest, forwardUrl: strin
 
 export const listenCommand = new Command('listen')
   .description('Attach to a localhost replay target and forward executions')
+  .argument('[url]', 'Local target URL to attach to (skips the menu), e.g. http://localhost:8771/hook')
   .option('--interval <ms>', 'Poll interval in milliseconds', '3000')
   .option('--account <name>', 'Account to use (overrides active account)')
   // #170: hidden from help — environments are an advanced concept (matching the
   // hidden config *-env subcommands); the flag still works for those who use it.
   .addOption(new Option('--environment <name>', 'Environment to use (overrides active environment)').hideHelp())
-  .action(async (opts) => {
+  .action(async (url: string | undefined, opts) => {
     const config = loadConfig();
     const context = resolveContext(config, { environment: opts.environment, account: opts.account });
 
@@ -293,7 +334,7 @@ export const listenCommand = new Command('listen')
 
     console.log(chalk.dim('Discovering localhost replay targets...\n'));
     const choices = await discoverTargets(api);
-    const chosen = await selectTarget(choices, api);
+    const chosen = await selectTarget(choices, api, url);
 
     const { target, project, endpoint } = chosen;
 

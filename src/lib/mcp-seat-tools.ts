@@ -60,6 +60,8 @@ interface SeatPrincipal {
   participantName: string;
   seatRef: string;
   expiresAt: string;
+  /** The chair's per-turn line (orientation `standingOrder`), read once at seating. */
+  standingOrder?: string | null;
 }
 
 // #363/#359: the room-state reads mount here too, so a seat asks the server what the
@@ -369,6 +371,30 @@ export interface SeatBriefing {
   orientation: string | null;
   canon: unknown;
   briefingNote: string | null;
+  /** The orientation post's `standingOrder` member, sanitized and capped; null when unset. */
+  standingOrder: string | null;
+}
+
+/** Longest standing order the envelope will carry; the chair writes one line, not a card. */
+export const STANDING_ORDER_MAX_CHARS = 240;
+
+/**
+ * Lift `standingOrder` off the orientation body. The body is untrusted text: only a
+ * string member counts, control characters go, whitespace collapses, and the result is
+ * capped. Anything else (not JSON, no member, wrong type, empty) is null.
+ */
+export function standingOrderFrom(orientation: string | null): string | null {
+  if (!orientation) return null;
+  try {
+    const parsed = JSON.parse(orientation) as { standingOrder?: unknown } | null;
+    const raw = parsed && typeof parsed === 'object' ? parsed.standingOrder : undefined;
+    if (typeof raw !== 'string') return null;
+    const clean = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!clean) return null;
+    return clean.length > STANDING_ORDER_MAX_CHARS ? clean.slice(0, STANDING_ORDER_MAX_CHARS) : clean;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -382,6 +408,7 @@ export function fitBriefing(briefing: SeatBriefing, maxBytes = REDEEM_BRIEFING_M
   const canon = briefing.canon as { Sections?: Array<Record<string, unknown>> } | null;
   return {
     orientationCaptureId: briefing.orientationCaptureId,
+    standingOrder: briefing.standingOrder,
     orientation: null,
     canon: canon && Array.isArray(canon.Sections)
       ? { ...canon, Sections: canon.Sections.map((s) => ({ ...s, RecapText: null })) }
@@ -403,7 +430,7 @@ const NEARING_SEAT_END_MINUTES = 60;
  * pattern). The envelope shape itself is unchanged - strictly additive.
  */
 export function buildSeatMeta(
-  principal: { expiresAt: string; participantName?: string } | null,
+  principal: { expiresAt: string; participantName?: string; standingOrder?: string | null } | null,
   attention?: AttentionRelay,
 ): SeatMetaEnvelope {
   if (!principal) {
@@ -430,6 +457,7 @@ export function buildSeatMeta(
     expiresInMinutes,
     state: nearing ? 'nearing_expiry' : 'ok',
     notice,
+    ...(principal.standingOrder ? { standingOrder: principal.standingOrder } : {}),
   };
 }
 
@@ -1139,6 +1167,7 @@ export function registerSeatTools(
         // a room with no orientation, or a read that fails leaves its member null and
         // the seat is still seated.
         const briefing = fitBriefing(await loadBriefing(seated, registry));
+        seated.standingOrder = briefing.standingOrder;
         // The receipt carries FACTS the agent relays (E5 discoverability) and no
         // credential material of any kind.
         return ok(
@@ -1208,6 +1237,7 @@ export function registerSeatTools(
     pendingRelease = null;
     opts.onStanding?.({ participantName: release.participantName, expiresAt: toUtcIso(release.expiresAt) });
     const briefing = fitBriefing(await loadBriefing(principal!, registry));
+    principal!.standingOrder = briefing.standingOrder;
     const checkedIn = release.custody === 'checked-in';
     return ok(
       {
@@ -1481,6 +1511,7 @@ async function loadBriefing(
     orientationCaptureId,
     orientation,
     canon,
+    standingOrder: standingOrderFrom(orientation),
     briefingNote: unavailable.length
       ? `Could not read ${unavailable.join(' or ')} right now (server error, not an empty room). ` +
         'Re-read with list_sections / get_capture / get_canon before treating this room as unoriented.'
