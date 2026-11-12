@@ -18,7 +18,8 @@ import {
 import { consoleMessages as msg, helpListing, verbHelp } from './console-messages.js';
 import { sanitizeStanza, sanitizeWireLine, sanitizeWireText } from './sanitize.js';
 import { AuthApiError } from './auth-api.js';
-import type { RoomApi, RoomCollection, RoomEndpoint, RoomProject, RoomSeat } from './console-room.js';
+import type { RoomApi, RoomCanonRow, RoomCollection, RoomEndpoint, RoomMap, RoomProject, RoomSeat, RoomSection } from './console-room.js';
+import { verifyChain } from './hashchain.js';
 import type { AttentionOrder } from './attention-relay.js';
 import type { PresenceLedger } from './presence.js';
 
@@ -70,7 +71,18 @@ export const FP_VERBS: ReadonlySet<string> = new Set([
   // discriminate channels, verbs carry acts.) The registry addition rides the
   // #282 gavel per the ruling's own terms.
   'fp:strike',
+  // #499 gap 5 (room-verb parity, built on Gene's word 2026-09-23): the review
+  // family the live rooms write. fp:review carries a `verdict` member re-linked
+  // to the proposal; fp:note is commentary on the record; fp:open opens a
+  // section for proposals. Known here so the feed stops tagging them unknown
+  // and the ledger can read a verdict off them.
+  'fp:review',
+  'fp:note',
+  'fp:open',
 ]);
+
+/** The review verdict words the ledger reads (#499 gap 5), off fp:review's verdict or an r: verb. */
+const REVIEW_WORDS: ReadonlySet<string> = new Set(['proceed', 'hold', 'finding', 'resolved', 'satisfied']);
 
 /**
  * The console's in-process room server, behind an injected seam (#253): the
@@ -132,8 +144,29 @@ export type ConsoleEvent =
         color: ConsoleColor;
         hidden: boolean;
         endpointSlug: string;
+        /**
+         * #499 gap 4: the room map's role for this handle (chair, host, producer,
+         * monitor, relayed) when the orientation roster names it; null for a
+         * minted seat the map does not mention. A map-only handle has no seat:
+         * its status IS the role word, live false, presence null.
+         */
+        role: string | null;
       }>;
     }
+  /**
+   * A read view (#499 gap 4/6): sections, the orientation, the canon, delivery
+   * receipts, the chain check. A title line then plain rows; renderers paint the
+   * title as info and the rows dim, exactly like help. Kept generic on purpose:
+   * the reads are for eyes, and every frontend renders them the same way.
+   */
+  /**
+   * Where the console IS (#499 gap 9): the bound room, or all null when the bind
+   * is cleared. The terminal already says it in the `bound` line, so its renderer
+   * prints nothing; a driving frontend (the nvim plugin) paints it somewhere
+   * persistent, because a feed of bylines never says which room they posted in.
+   */
+  | { type: 'room'; projectSlug: string | null; endpointSlug: string | null; name: string | null }
+  | { type: 'view'; title: string; lines: string[] }
   /**
    * The status facts table (#246, layers 1+2): server/roster facts the room cannot
    * be wrong about, rendered instantly, plus the seat's latest volunteered stanza.
@@ -176,6 +209,12 @@ export type ConsoleEvent =
         ratifiedBy: string | null;
         /** Disposition arrival time; the nvim glance fades settled rows from this clock. */
         settledAt: string | null;
+        /**
+         * #499 gap 5: the latest review verdict the log carried for this row
+         * (proceed, hold, finding, resolved, satisfied), null when unreviewed.
+         * A pending proposal with a proceed is a different state from a bare one.
+         */
+        verdict: string | null;
       }>;
     }
   | { type: 'colors'; colors: readonly string[] }
@@ -221,6 +260,14 @@ export type ConsoleEvent =
         verb: FeedVerb | null;
         /** The capture id this post answers (§1 row 7); renderers show it in the meta line. */
         re: string | null;
+        /** #499 gap 13: the section the post is about (`for`); renderers show it in the meta line. */
+        for: string | null;
+        /**
+         * #499 gap 9/10: the wire `from` claim, raw. The frontend arms a post with
+         * it: answering the post addresses this name. On a signed room the signer
+         * label is the authority (byline); on an unsigned room this is all there is.
+         */
+        from: string | null;
         /** The ! flag on the wire; renderers mark panic posts loudly. */
         panic: boolean;
         /** The recipe-declared status stanza riding this post; rendered generically. */
@@ -304,6 +351,29 @@ interface ProposalRecord {
    */
   state: 'pending' | 'ratified' | 'retracted' | 'struck';
   settledAt: string | null;
+  /** #499 gap 3: the section the proposal named (`for`), what the gavel carries forward. */
+  section: string | null;
+  /** #499 gap 3: who to address the ruling to - the seat handle, else the wire from claim. */
+  author: string | null;
+  /** #499 gap 5: the latest review verdict off the log. */
+  verdict: string | null;
+}
+
+/** What this session knows about one post on the feed (#499): the facts the acts reuse. */
+interface FeedPostFacts {
+  /** The wire from claim, raw. */
+  from: string | null;
+  /** The roster handle when the signer holds a seat. */
+  handle: string | null;
+  mine: boolean;
+  section: string | null;
+  text: string;
+  summary: string | null;
+  /** The parsed body when it was a JSON object; :verify walks these for a chain. */
+  body: Record<string, unknown> | null;
+  signerLabel: string | null;
+  /** The wire `re`, raw: for a proposal, the standing post it changes (the rooms' convention). */
+  re: string | null;
 }
 
 function info(text: string): ConsoleEvent {
@@ -337,6 +407,10 @@ function parseErrorText(code: ParseErrorCode, token?: string): string {
     case 'list_usage': return msg.listUsage;
     case 'set_usage': return msg.setUsage;
     case 'invalid_handle': return msg.invalidHandle(token ?? '');
+    case 'for_usage': return msg.forUsage;
+    case 'sections_usage': return msg.sectionsUsage;
+    case 'pin_usage': return msg.pinUsage;
+    case 'canon_usage': return msg.canonUsage;
   }
 }
 
@@ -350,6 +424,22 @@ export class ConsoleEngine {
   private feedPrimed = false;
   private pendingRevoke: { handles: string[] } | null = null;
   private pendingIdentity: { guestName: string } | null = null;
+  /** The re-seat y/N (#499 gap 16): the next line answers for the named live seat. */
+  private pendingReseat: { guestName: string; inviteId: string; handle: string } | null = null;
+  /**
+   * The room map (#499 gap 1/4): sections and the orientation roster, loaded at
+   * bind and refreshed by the read verbs. Null when the server has none (an
+   * older server, or a room never oriented).
+   */
+  private roomMap: RoomMap | null = null;
+  /** Per-post facts this session's feed carried (#499), by capture id. */
+  private feedPosts = new Map<string, FeedPostFacts>();
+  /** The last capture this console posted (#499 gap 6): what bare :receipts reads. */
+  private lastPosted: string | null = null;
+  /** Boarding passes minted this session, by console handle (#499 gap 16: :seat <handle> pass). */
+  private passes = new Map<string, Extract<ConsoleEvent, { type: 'pairing' }>>();
+  /** The section a :for modifier is filing the current line for (#499 gap 2); transient. */
+  private forSection: string | null = null;
   /** The :tag picker (#251): the next line answers with a number or a new name. */
   private pendingTag: { captureId: string; options: Array<{ name: string; id: string | null }> } | null = null;
   /** undefined = not yet loaded from the view-state file. */
@@ -399,7 +489,7 @@ export class ConsoleEngine {
    * next input line answers with a number; `text` is the chair's prose held
    * for the picked act (the :re message, or ratify/retract scoping prose).
    */
-  private pendingRecordPick: { mode: 'ratify' | 'retract' | 're'; ids: string[]; text: string | null } | null = null;
+  private pendingRecordPick: { mode: 'ratify' | 'retract' | 're' | 'review'; ids: string[]; text: string | null; verdict?: string } | null = null;
   /**
    * Posts the log has struck (#282): fp:strike re-links carry it, and the
    * console's own :strike applies it optimistically. A struck id re-delivered
@@ -444,6 +534,21 @@ export class ConsoleEngine {
   }
 
   /** The bound room, for surfaces that name it (the #288 preflight); null while unbound. */
+  /**
+   * The bound room as an event, for frontends that show it persistently rather
+   * than in the scroll (#499 gap 9). Null members mean no room is bound.
+   */
+  roomEvent(): ConsoleEvent {
+    return this.room
+      ? {
+          type: 'room',
+          projectSlug: this.room.project.slug,
+          endpointSlug: this.room.endpointSlug,
+          name: this.room.endpoint.name ?? null,
+        }
+      : { type: 'room', projectSlug: null, endpointSlug: null, name: null };
+  }
+
   roomInfo(): { projectSlug: string; endpointSlug: string } | null {
     return this.room ? { projectSlug: this.room.project.slug, endpointSlug: this.room.endpointSlug } : null;
   }
@@ -485,7 +590,22 @@ export class ConsoleEngine {
    * else the fallback.
    */
   private fromName(): string {
-    return this.profile().name ?? this.chairAddress() ?? CHAIR_FROM;
+    return this.profile().name ?? this.mapChairHandle() ?? this.chairAddress() ?? CHAIR_FROM;
+  }
+
+  /**
+   * #499 gap 8: the handle the room map names as chair, when it names one. With
+   * no :me name set the console posts under it, so the record reads the way the
+   * orientation does (every live room named the chair gene while the console
+   * stamped director).
+   */
+  private mapChairHandle(): string | null {
+    return this.roomMap?.roster.find((r) => r.role === 'chair')?.handle ?? null;
+  }
+
+  /** The section handles the room publishes; empty when it publishes no map. */
+  private sectionHandles(): string[] {
+    return this.roomMap?.sections.map((x) => x.handle) ?? [];
   }
 
   /** Run one input line to completion; the returned events are the whole answer. */
@@ -495,6 +615,19 @@ export class ConsoleEngine {
       const pending = this.pendingIdentity;
       this.pendingIdentity = null;
       return this.answerIdentity(line, pending.guestName);
+    }
+    // The re-seat y/N (#499 gap 16) owns the next line: y revokes and re-mints.
+    if (this.pendingReseat) {
+      const pending = this.pendingReseat;
+      this.pendingReseat = null;
+      const answer = line.trim().toLowerCase();
+      if (answer !== 'y' && answer !== 'yes') return [info(msg.reseatCancelled)];
+      try {
+        return await this.performReseat(pending.guestName, pending.inviteId, pending.handle);
+      } catch (err) {
+        if (err instanceof AuthApiError) return [error(this.httpErrorText(err))];
+        throw err;
+      }
     }
     // A pending y/N owns the next line: y runs the revoke, anything else cancels.
     if (this.pendingRevoke) {
@@ -528,7 +661,7 @@ export class ConsoleEngine {
       const n = /^\d+$/.test(answer) ? Number(answer) : NaN;
       if (!Number.isInteger(n) || n < 1 || n > pending.ids.length) return [info(msg.recordPickerCancelled)];
       try {
-        return await this.answerRecordPick(pending.mode, pending.ids[n - 1], pending.text);
+        return await this.answerRecordPick(pending.mode, pending.ids[n - 1], pending.text, pending.verdict);
       } catch (err) {
         if (err instanceof AuthApiError) return [error(this.httpErrorText(err))];
         throw err;
@@ -597,12 +730,45 @@ export class ConsoleEngine {
         if (parsed.what === 'decisions') return this.listDecisions();
         return this.listSeats();
       case 'set':
-        return parsed.what === 'project' ? this.setProject(parsed.slug) : this.setEndpoint(parsed.slug);
+        return parsed.what === 'project' ? this.setProject(parsed.slug) : this.setEndpoint(parsed.slug, parsed.force === true);
       case 'bind': return this.bindRoom(parsed.project, parsed.endpoint);
-      case 'seat': return this.mintSeat(parsed.guestName);
+      case 'seat': return this.mintSeat(parsed.guestName, parsed.force === true);
+      case 'seat-pass': return this.reprintPass(parsed.handle);
       case 'exit': return [{ type: 'exit' }];
       case 'say': return this.post({ kind: 'message', text: parsed.text, to: null });
       case 'targeted': return this.targeted(parsed);
+      // #499 (room-verb parity)
+      case 'for': return this.filedFor(parsed.section, parsed.line);
+      case 'none': return [info(msg.noneHint)];
+      case 'sections': return parsed.open || parsed.remove ? this.writeSections(parsed.open ?? null, parsed.remove ?? null) : this.viewSections();
+      case 'orient': return this.viewOrientation();
+      case 'canon': return this.viewCanon(parsed.section ?? null);
+      case 'verify': return this.verifyFeed();
+      case 'receipts': return this.viewReceipts(parsed.token ?? null);
+      case 'pin': return this.pin(parsed.token, parsed.section, parsed.text ?? null);
+      case 'review': return this.review(parsed.verdict, parsed.token ?? null, parsed.text ?? null);
+    }
+  }
+
+  // ── :for (#499 gap 2): the section modifier ────────────────────────────────
+
+  /**
+   * `:for <section> <line>`: the rest re-parses as a whole line and every post it
+   * makes carries `for`. The section is checked against the published map when
+   * there is one (the server would refuse a proposal naming an unknown section;
+   * the console refuses every post the same way, before anything is sent).
+   */
+  private async filedFor(section: string, line: string): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    const handles = this.sectionHandles();
+    if (handles.length > 0 && !handles.includes(section)) return [error(msg.forUnknownSection(section, handles))];
+    const inner = parseLine(line);
+    if (inner.kind === 'for') return [error(msg.forUsage)];
+    this.forSection = section;
+    try {
+      return await this.dispatch(inner);
+    } finally {
+      this.forSection = null;
     }
   }
 
@@ -636,6 +802,28 @@ export class ConsoleEngine {
     return [{ type: 'projects', rows }];
   }
 
+  /** Every endpoint on the account (#499 gap 15): the widened search space. */
+  private async allEndpoints(): Promise<Array<RoomEndpoint & { projectSlug: string }>> {
+    const out: Array<RoomEndpoint & { projectSlug: string }> = [];
+    for (const p of await this.api.listProjects()) {
+      for (const e of await this.api.listEndpoints(p.id)) out.push({ ...e, projectSlug: p.slug });
+    }
+    return out;
+  }
+
+  /**
+   * The room map (#499 gap 1/4), best effort: a server without the sections read
+   * (404) or a room never oriented leaves it null and nothing else changes.
+   */
+  private async refreshRoomMap(): Promise<void> {
+    if (!this.room) return;
+    try {
+      this.roomMap = await this.api.getRoomMap(this.room.project.id, this.room.endpoint.id);
+    } catch {
+      this.roomMap = null;
+    }
+  }
+
   private async scopedEndpoints(): Promise<Array<RoomEndpoint & { projectSlug: string }>> {
     const projects = this.project ? [this.project] : await this.api.listProjects();
     const out: Array<RoomEndpoint & { projectSlug: string }> = [];
@@ -655,6 +843,7 @@ export class ConsoleEngine {
   private async listSeats(): Promise<ConsoleEvent[]> {
     if (this.room) {
       await this.refreshRoster();
+      await this.refreshRoomMap();
       return [this.rosterEvent(this.roster, this.room.endpointSlug, this.room.endpoint.id)];
     }
     // Unbound: aggregate the set scope (project, or everything) the same way.
@@ -683,9 +872,28 @@ export class ConsoleEngine {
           color: getSeatView(s.endpointId, s.handle).color ?? this.paletteDefault(i),
           hidden: getSeatView(s.endpointId, s.handle).hidden === true,
           endpointSlug: s.endpointSlug,
+          role: null,
         })),
       },
     ];
+  }
+
+  /** The map's role for a minted handle, null when the map does not name it. */
+  private mapRole(handle: string): string | null {
+    return this.roomMap?.roster.find((r) => r.handle === handle)?.handle === handle
+      ? (this.roomMap?.roster.find((r) => r.handle === handle)?.role ?? null)
+      : null;
+  }
+
+  /**
+   * #499 gap 4: the room map's handles that hold no minted seat (the chair, the
+   * host, hosted routines, or every handle on an unsigned room where no seat can
+   * exist). They render as roster rows wearing the role word for a status.
+   */
+  private mapOnlyHandles(): Array<{ handle: string; role: string }> {
+    if (!this.roomMap) return [];
+    const minted = new Set(this.roster.flatMap((s) => [s.handle, handleBase(s.guestName)]));
+    return this.roomMap.roster.filter((r) => !minted.has(r.handle));
   }
 
   /**
@@ -719,6 +927,7 @@ export class ConsoleEngine {
         ratifiedBy:
           rec.state === 'ratified' && rulings.has(id) ? rulings.get(id)!.slice(0, RECORD_REF_CHARS) : null,
         settledAt: rec.settledAt,
+        verdict: rec.verdict,
       })),
     };
   }
@@ -746,21 +955,39 @@ export class ConsoleEngine {
   }
 
   private rosterEvent(roster: RosterEntry[], endpointSlug: string, endpointId: string): ConsoleEvent {
-    if (roster.length === 0) return info(msg.noSeats);
+    const mapOnly = this.mapOnlyHandles();
+    if (roster.length === 0 && mapOnly.length === 0) return info(msg.noSeats);
     return {
       type: 'roster',
-      rows: roster.map((s, i) => ({
-        handle: s.handle,
-        guestName: s.guestName,
-        status: s.status,
-        live: s.status === 'accepted',
-        held: this.held.has(s.handle),
-        greyed: this.seatGreyed(s),
-        presence: this.seatPresence(s),
-        color: getSeatView(endpointId, s.handle).color ?? this.paletteDefault(i),
-        hidden: getSeatView(endpointId, s.handle).hidden === true,
-        endpointSlug,
-      })),
+      rows: [
+        ...roster.map((s, i) => ({
+          handle: s.handle,
+          guestName: s.guestName,
+          status: s.status,
+          live: s.status === 'accepted',
+          held: this.held.has(s.handle),
+          greyed: this.seatGreyed(s),
+          presence: this.seatPresence(s),
+          color: getSeatView(endpointId, s.handle).color ?? this.paletteDefault(i),
+          hidden: getSeatView(endpointId, s.handle).hidden === true,
+          endpointSlug,
+          role: this.mapRole(s.handle),
+        })),
+        // Map-only handles (#499 gap 4): no seat, so the status IS the role word.
+        ...mapOnly.map((r, i) => ({
+          handle: r.handle,
+          guestName: r.handle,
+          status: r.role,
+          live: false,
+          held: false,
+          greyed: false,
+          presence: null,
+          color: getSeatView(endpointId, r.handle).color ?? this.paletteDefault(roster.length + i),
+          hidden: getSeatView(endpointId, r.handle).hidden === true,
+          endpointSlug,
+          role: r.role,
+        })),
+      ],
     };
   }
 
@@ -776,6 +1003,7 @@ export class ConsoleEngine {
       this.feedPrimed = false;
       this.clearRoomState();
       events.push(info(msg.projectCleared));
+      events.push(this.roomEvent());
     }
     this.project = match;
     events.push(info(msg.projectSet(slug)));
@@ -800,8 +1028,94 @@ export class ConsoleEngine {
     return [...projectEvents, ...endpointEvents];
   }
 
-  private async setEndpoint(slug: string): Promise<ConsoleEvent[]> {
-    const candidates = (await this.scopedEndpoints()).filter((e) => e.slug === slug);
+  /**
+   * #499 gap 15 (agreed by Gene 2026-09-23): the room by partial name, across
+   * every project. Resolution order: exact slug in the set project; exact slug in
+   * any project; unique prefix of slug or name in any project; unique substring.
+   * Several candidates list in the form :set takes back; `!` takes the first.
+   */
+  /**
+   * Write the room map (#499 gap 17): open a topic, redescribe one, or close one.
+   * The chair could read the map here since gap 4 but had to leave the console to
+   * change it, which made opening a topic a trip through MCP. The seats' guard is
+   * untouched: they still refuse anything not on the map, so this moves the map,
+   * never the rule.
+   *
+   * The server takes the map WHOLE, so this is read-modify-write off the copy the
+   * bind already fetched; `stateOnly` keeps the orientation lock where it is.
+   */
+  private async writeSections(
+    open: { handle: string; description: string } | null,
+    remove: string | null,
+  ): Promise<ConsoleEvent[]> {
+    // Unreachable in practice (the unbound guard answers first), kept so a future
+    // caller cannot write the map with no room bound.
+    if (!this.room) return [error(msg.unbound)];
+    await this.refreshRoomMap();
+    const current = this.roomMap?.sections ?? [];
+    let next: RoomSection[];
+    let done: ConsoleEvent;
+    if (remove) {
+      if (!current.some((x) => x.handle === remove)) {
+        return [error(msg.sectionUnknown(remove, current.map((x) => x.handle)))];
+      }
+      next = current.filter((x) => x.handle !== remove);
+      done = info(msg.sectionClosed(remove));
+    } else if (open) {
+      const existing = current.some((x) => x.handle === open.handle);
+      next = existing
+        ? current.map((x) => (x.handle === open.handle ? { ...x, description: open.description } : x))
+        : [...current, { handle: open.handle, description: open.description }];
+      done = info(existing ? msg.sectionRedescribed(open.handle) : msg.sectionOpened(open.handle));
+    } else {
+      return [error(msg.sectionsUsage)];
+    }
+    try {
+      await this.api.setSections(this.room.project.id, this.room.endpoint.id, next);
+    } catch (e) {
+      // Owner-only on the server, so a seat or member answers 404: a whose-act
+      // answer, not a missing room. Everything else goes through the #245 map,
+      // which is where the read-only wall is said in the chair's own terms. The
+      // raw server text there is written for an agent that cannot widen its own
+      // grant, and in this console the reader IS the user it tells you to ask.
+      if (e instanceof AuthApiError) {
+        return [error(e.status === 404 ? msg.sectionsNotYours : this.httpErrorText(e))];
+      }
+      const text = e instanceof Error ? e.message : String(e);
+      return [error(/404|not found/i.test(text) ? msg.sectionsNotYours : text)];
+    }
+    await this.refreshRoomMap();
+    // Say what stands now, not just what changed: the map is small and the chair
+    // is about to post against it.
+    return [done, ...(await this.viewSections())];
+  }
+
+  private async setEndpoint(slug: string, force = false): Promise<ConsoleEvent[]> {
+    const wanted = slug.toLowerCase();
+    const scoped = await this.scopedEndpoints();
+    let candidates = scoped.filter((e) => e.slug === slug);
+    let widened = false;
+    if (candidates.length === 0 && this.project) {
+      // Exact slug anywhere: the set project is a default, never a wall.
+      const all = await this.allEndpoints();
+      candidates = all.filter((e) => e.slug === slug);
+      widened = candidates.length > 0;
+    }
+    if (candidates.length === 0) {
+      const all = this.project ? await this.allEndpoints() : scoped;
+      const lower = (e: RoomEndpoint) => ({ slug: e.slug.toLowerCase(), name: (e.name ?? '').toLowerCase() });
+      // A slug match outranks a name match at each step, so `!` and the listing
+      // order both prefer the room whose address was typed.
+      const bySlugFirst = (test: (l: { slug: string; name: string }) => boolean, testName: (l: { slug: string; name: string }) => boolean) => [
+        ...all.filter((e) => test(lower(e))),
+        ...all.filter((e) => !test(lower(e)) && testName(lower(e))),
+      ];
+      const prefix = bySlugFirst((l) => l.slug.startsWith(wanted), (l) => l.name.startsWith(wanted));
+      candidates = prefix.length > 0
+        ? prefix
+        : bySlugFirst((l) => l.slug.includes(wanted), (l) => l.name.includes(wanted));
+      widened = candidates.length > 0;
+    }
     if (candidates.length === 0) {
       // A PROJECT slug here is the trail a chair leaves reaching for the whole
       // room at once; point at the form that does that instead of repeating no.
@@ -809,8 +1123,14 @@ export class ConsoleEngine {
       if (projects.some((p) => p.slug === slug)) return [error(msg.endpointSlugIsProject(slug))];
       return [error(this.project ? msg.unknownEndpointInProject(slug, this.project.slug) : msg.unknownEndpoint(slug))];
     }
-    if (candidates.length > 1) return [error(msg.ambiguousEndpoint(slug))];
+    if (candidates.length > 1 && !force) {
+      return [
+        info(msg.endpointCandidatesHeader(slug, candidates.length)),
+        ...candidates.map((e) => info(msg.endpointCandidateRow(e.projectSlug, e.slug, e.name))),
+      ];
+    }
     const endpoint = candidates[0];
+    const matchNote = widened || candidates.length > 1 ? [info(msg.endpointMatchedBy(slug, endpoint.projectSlug, endpoint.slug))] : [];
     if (!this.project || this.project.id !== endpoint.projectId) {
       const projects = await this.api.listProjects();
       this.project = projects.find((p) => p.id === endpoint.projectId) ?? this.project;
@@ -827,7 +1147,12 @@ export class ConsoleEngine {
     this.feedPrimed = false;
     this.clearRoomState();
     await this.refreshRoster();
-    const events: ConsoleEvent[] = [info(msg.bound(this.room.project.slug, this.room.endpointSlug, this.roster.length))];
+    await this.refreshRoomMap();
+    const events: ConsoleEvent[] = [...matchNote, info(msg.bound(this.room.project.slug, this.room.endpointSlug, this.roster.length))];
+    events.push(this.roomEvent());
+    // #499 gap 8: the map's chair handle is the byline when no :me name is set.
+    const chair = this.mapChairHandle();
+    if (chair && this.profile().name === null) events.push(info(msg.postingAsChair(chair)));
     if (this.room.signingEnabled && !this.api.hasSigningKey(endpoint.id)) {
       events.push(error(msg.noSigningKey));
     }
@@ -1056,10 +1381,10 @@ export class ConsoleEngine {
    * :tag idiom, a numbered pick on the next line. Only a number acts; anything
    * else cancels, because a miskey must never gavel the wrong item.
    */
-  private recordPicker(mode: 'ratify' | 'retract' | 're', ids: string[], text: string | null): ConsoleEvent[] {
-    this.pendingRecordPick = { mode, ids, text };
+  private recordPicker(mode: 'ratify' | 'retract' | 're' | 'review', ids: string[], text: string | null, verdict?: string): ConsoleEvent[] {
+    this.pendingRecordPick = { mode, ids, text, ...(verdict ? { verdict } : {}) };
     const lines = [
-      msg.recordPickerHeader(mode),
+      mode === 'review' ? msg.reviewPickerHeader(verdict ?? 'review') : msg.recordPickerHeader(mode),
       ...ids.map((id, i) => msg.recordPickerRow(i + 1, id.slice(0, RECORD_REF_CHARS), this.proposalPreview(id) ?? '')),
       msg.recordPickerPrompt,
     ];
@@ -1067,9 +1392,10 @@ export class ConsoleEngine {
   }
 
   /** The picked entry routes to the mode's act, the held prose riding along. */
-  private async answerRecordPick(mode: 'ratify' | 'retract' | 're', id: string, text: string | null): Promise<ConsoleEvent[]> {
+  private async answerRecordPick(mode: 'ratify' | 'retract' | 're' | 'review', id: string, text: string | null, verdict?: string): Promise<ConsoleEvent[]> {
     if (mode === 'ratify') return this.performRatify(id, text, false);
     if (mode === 'retract') return this.performRetract(id, text);
+    if (mode === 'review') return this.performReview(verdict ?? 'proceed', id, text);
     return this.performReply(id, text ?? '');
   }
 
@@ -1113,9 +1439,14 @@ export class ConsoleEngine {
    */
   private async performRatify(proposalId: string, text: string | null, again: boolean): Promise<ConsoleEvent[]> {
     const ledgerBefore = this.ledgerVersion;
+    // #499 gap 3: the gavel carries the proposal's section and addresses its
+    // author, so the ruling files where the proposal was and wakes who made it.
+    const facts = this.feedPosts.get(proposalId);
+    const section = this.forSection ?? this.proposals.get(proposalId)?.section ?? facts?.section ?? null;
     const { events, ok } = await this.deliver({
       kind: 'message',
-      to: null,
+      to: this.authorAddress(proposalId),
+      for: section,
       verb: 'fp:ratify',
       re: proposalId,
       ...(text ? { text } : {}),
@@ -1130,8 +1461,291 @@ export class ConsoleEngine {
     this.lastRatification = { proposalId };
     const ref = proposalId.slice(0, RECORD_REF_CHARS);
     events.push(info(again ? msg.reRatified(ref, this.proposalPreview(proposalId)) : msg.ratified(ref, this.proposalPreview(proposalId))));
+    // The canon swap (#499 gap 3): pin the ruling for its section and file the
+    // receipt the canon derives from. The ruling is already on the record; a
+    // failure here says so and never unwinds it.
+    if (section) {
+      try {
+        events.push(...(await this.fileCanon(proposalId, section, text ?? rec?.summary ?? facts?.text ?? null)));
+      } catch (err) {
+        const detail = err instanceof AuthApiError ? this.httpErrorText(err) : err instanceof Error ? err.message : String(err);
+        events.push(error(msg.ratifyCanonFailed(detail)));
+      }
+    } else if (this.sectionHandles().length > 0) {
+      events.push(info(msg.ratifyNoSection(ref)));
+    }
     if (this.ledgerVersion !== ledgerBefore) events.push(this.decisionsEvent());
     return events;
+  }
+
+  /**
+   * Who to address a re-linked act to (#499 gap 10): the post's seat handle
+   * when the signer holds a seat, else the wire from claim; null when the post
+   * was the chair's own. The address comes from the post, not the roster, so an
+   * unsigned author is reachable.
+   */
+  private authorAddress(postId: string): string | null {
+    const facts = this.feedPosts.get(postId);
+    if (!facts || facts.mine) return null;
+    const from = facts.handle ?? facts.from;
+    if (!from) return null;
+    if (from.toLowerCase() === (this.chairAddress() ?? CHAIR_FROM).toLowerCase()) return null;
+    if (from.toLowerCase() === this.fromName().toLowerCase()) return null;
+    return from;
+  }
+
+  // ── the canon pin (#499 gap 3): pin plus the r:collate receipt ─────────────
+
+  /** :pin <ref> <section> [recap]: file any post as what stands in a section. */
+  private async pin(token: string, section: string, text: string | null): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    const handles = this.sectionHandles();
+    if (handles.length > 0 && !handles.includes(section)) return [error(msg.canonUnknownSection(section, handles))];
+    const resolved = this.resolveCaptureId(token);
+    if ('error' in resolved) return [resolved.error];
+    if (!this.feedIds.has(resolved.id)) return [error(msg.unknownRecordRef(token))];
+    const facts = this.feedPosts.get(resolved.id);
+    return this.fileCanon(resolved.id, section, text ?? facts?.summary ?? facts?.text ?? null);
+  }
+
+  /**
+   * The canon swap, in the order the server derives it (#359): the ruling joins
+   * the section's collection (the row's collection when one stands, else the
+   * session-bound collection, else one named canon created on the spot); the
+   * previous standing item leaves it; then the r:collate receipt posts, `to`
+   * canon, `for` the section, args [section, collectionId, decisionId], re the
+   * decision, text the recap. The canon read derives from the newest such
+   * receipt and checks the pin, so both halves matter.
+   */
+  private async fileCanon(decisionId: string, section: string, recap: string | null): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    const events: ConsoleEvent[] = [];
+    const projectId = this.room.project.id;
+    const endpointId = this.room.endpoint.id;
+    let standing: RoomCanonRow | null = null;
+    let roomCollectionId: string | null = null;
+    try {
+      const canon = await this.api.getCanon(projectId, endpointId);
+      standing = canon.sections.find((r) => r.sectionHandle === section) ?? null;
+      // One canon collection per room is the convention (the launch kit's "Launch
+      // kit"): a section with nothing standing files where the others already do.
+      roomCollectionId = canon.sections.find((r) => r.collectionId !== null)?.collectionId ?? null;
+    } catch {
+      standing = null;
+    }
+    // Which collection: the standing row's, else the room's canon collection,
+    // else the newest session-bound one with an id, else canon (created with
+    // this capture as its first item).
+    let collectionId = standing?.collectionId ?? roomCollectionId ?? null;
+    let collectionName: string | null = null;
+    if (collectionId === null) {
+      for (const [name, id] of [...this.collections.entries()].reverse()) {
+        if (id !== null) { collectionId = id; collectionName = name; break; }
+      }
+    }
+    if (collectionId === null) {
+      // A room with exactly ONE collection files into it (the launch-kit room's
+      // "Launch kit" was pinned by hand, so no receipt names it yet); only a
+      // room with none or several falls through to a collection named canon.
+      const rows = await this.api.listCollections(projectId, endpointId);
+      const existing = rows.length === 1 ? rows[0] : rows.find((c) => c.name.toLowerCase() === 'canon') ?? null;
+      if (existing) {
+        collectionId = existing.id;
+        collectionName = existing.name;
+        this.collections.set(existing.name, existing.id);
+      } else {
+        const created = await this.api.createCollection(projectId, endpointId, 'canon', [decisionId]);
+        this.collections.set(created.name, created.id);
+        collectionId = created.id;
+        collectionName = created.name;
+        events.push(info(msg.collectionCreated(created.name)));
+      }
+    }
+    if (collectionName === null) {
+      const rows = await this.api.listCollections(projectId, endpointId);
+      collectionName = rows.find((c) => c.id === collectionId)?.name ?? collectionId;
+    }
+    await this.api.addToCollection(projectId, endpointId, collectionId, [decisionId]);
+    const ref = decisionId.slice(0, RECORD_REF_CHARS);
+    events.push(info(msg.pinned(ref, section, collectionName)));
+    // What leaves the collection: the section's standing ruling when the canon
+    // names one; else the post the proposal re-links to, which by the rooms'
+    // convention IS the standing post it changes (the launch-kit room was
+    // pinned by hand, so its canon names nothing and only the re knows).
+    const facts = this.feedPosts.get(decisionId);
+    const reTarget = facts?.re ? (this.resolveLogRef(facts.re) ?? (facts.re.length >= CAPTURE_ID_PREFIX_FLOOR ? facts.re : null)) : null;
+    const previous = standing?.decisionCaptureId ?? reTarget;
+    if (previous && previous !== decisionId && (standing?.decisionCaptureId === null || standing?.decisionCaptureId === undefined || standing.collectionId === collectionId)) {
+      const { removedCount } = await this.api.removeFromCollection(projectId, endpointId, collectionId, [previous]);
+      if (removedCount > 0) events.push(info(msg.pinReplaced(previous.slice(0, RECORD_REF_CHARS))));
+    }
+    const { events: receipt, ok } = await this.deliver({
+      kind: 'message',
+      to: 'canon',
+      for: section,
+      verb: 'r:collate',
+      args: [section, collectionId, decisionId],
+      re: decisionId,
+      ...(recap ? { text: recap } : {}),
+    });
+    events.push(...receipt);
+    if (ok) events.push(info(msg.collateFiled(section)));
+    return events;
+  }
+
+  // ── review verdicts (#499 gap 5) ───────────────────────────────────────────
+
+  /**
+   * :proceed | :hold | :finding | :resolved | :satisfied [ref] [prose]: a verdict
+   * on a proposal, short of the gavel. Wire form fp:review with a `verdict`
+   * member, re-linked, addressed to the author, filed for the section. The
+   * ledger keeps the latest verdict beside the pending row.
+   */
+  private async review(verdict: string, token: string | null, text: string | null): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    if (token !== null) {
+      const resolved = this.resolveCaptureId(token);
+      if ('error' in resolved) return [resolved.error];
+      if (!this.feedIds.has(resolved.id)) return [error(msg.unknownRecordRef(token))];
+      return this.performReview(verdict, resolved.id, text);
+    }
+    const pending = this.pendingProposalIds();
+    if (pending.length === 0) return [info(msg.nothingPendingReview(verdict))];
+    if (pending.length === 1) return this.performReview(verdict, pending[0], text);
+    return this.recordPicker('review', pending, text, verdict);
+  }
+
+  private async performReview(verdict: string, postId: string, text: string | null): Promise<ConsoleEvent[]> {
+    const ledgerBefore = this.ledgerVersion;
+    const facts = this.feedPosts.get(postId);
+    const { events, ok } = await this.deliver({
+      kind: 'message',
+      to: this.authorAddress(postId),
+      for: this.forSection ?? this.proposals.get(postId)?.section ?? facts?.section ?? null,
+      verb: 'fp:review',
+      verdict,
+      re: postId,
+      ...(text ? { text } : {}),
+    });
+    if (!ok) return events;
+    this.applyVerdict(postId, verdict);
+    events.push(info(msg.reviewed(verdict, postId.slice(0, RECORD_REF_CHARS))));
+    if (this.ledgerVersion !== ledgerBefore) events.push(this.decisionsEvent());
+    return events;
+  }
+
+  /** The verdict mutation, shared by the console act and the log's derivation (idempotent). */
+  private applyVerdict(postId: string, verdict: string): void {
+    const rec = this.proposals.get(postId);
+    if (!rec || rec.verdict === verdict) return;
+    rec.verdict = verdict;
+    this.ledgerVersion++;
+  }
+
+  // ── the read side (#499 gap 4) ─────────────────────────────────────────────
+
+  private async viewSections(): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    await this.refreshRoomMap();
+    const map = this.roomMap;
+    if (!map || (map.sections.length === 0 && map.roster.length === 0)) return [info(msg.noSections)];
+    return [{ type: 'view', title: msg.sectionsHeader, lines: this.mapLines(map) }];
+  }
+
+  private mapLines(map: RoomMap): string[] {
+    const lines = map.sections.map((x) => msg.sectionRow(x.handle, x.description));
+    if (map.roster.length > 0) {
+      lines.push('', msg.rosterMapHeader, ...map.roster.map((r) => msg.rosterMapRow(r.handle, r.role)));
+    }
+    return lines.map(sanitizeWireLine);
+  }
+
+  private async viewOrientation(): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    await this.refreshRoomMap();
+    const map = this.roomMap;
+    if (!map?.orientationCaptureId) return [info(msg.noOrientation)];
+    const raw = await this.api.getCaptureBody(this.room.endpoint.id, map.orientationCaptureId);
+    let text = raw ?? '';
+    try {
+      const parsed = JSON.parse(raw ?? '') as { text?: unknown };
+      if (parsed && typeof parsed === 'object' && typeof parsed.text === 'string') text = parsed.text;
+    } catch {
+      /* a non-JSON orientation renders raw */
+    }
+    const lines = sanitizeWireText(text).split('\n').map((l) => `  ${l}`);
+    if (map.sections.length > 0 || map.roster.length > 0) lines.push('', ...this.mapLines(map));
+    return [{ type: 'view', title: msg.orientationHeader(map.orientationCaptureId), lines }];
+  }
+
+  private async viewCanon(section: string | null): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    const canon = await this.api.getCanon(this.room.project.id, this.room.endpoint.id);
+    if (section !== null) {
+      const row = canon.sections.find((r) => r.sectionHandle === section);
+      if (!row) return [error(msg.canonUnknownSection(section, canon.sections.map((r) => r.sectionHandle)))];
+      const lines = [msg.canonRow(row.sectionHandle, row.decisionCaptureId?.slice(0, RECORD_REF_CHARS) ?? null, row.ratifiedAt, row.superseded)];
+      if (row.recapText) lines.push(...sanitizeWireText(row.recapText).split('\n').map((l) => `    ${l}`));
+      return [{ type: 'view', title: msg.canonHeader, lines: lines.map(sanitizeWireLine) }];
+    }
+    if (canon.sections.every((r) => r.recapText === null && r.decisionCaptureId === null)) return [info(msg.noCanon)];
+    const lines = canon.sections.flatMap((row) => {
+      const head = msg.canonRow(row.sectionHandle, row.decisionCaptureId?.slice(0, RECORD_REF_CHARS) ?? null, row.ratifiedAt, row.superseded);
+      const recap = row.recapText ? sanitizeWireLine(row.recapText.split('\n')[0]).slice(0, RECORD_SUMMARY_CHARS) : null;
+      return recap ? [head, `    ${recap}`] : [head];
+    });
+    return [{ type: 'view', title: msg.canonHeader, lines: lines.map(sanitizeWireLine) }];
+  }
+
+  // ── receipts and the chain (#499 gap 6) ────────────────────────────────────
+
+  private async viewReceipts(token: string | null): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    let id: string;
+    if (token === null) {
+      if (!this.lastPosted) return [info(msg.noReceiptsTarget)];
+      id = this.lastPosted;
+    } else {
+      const resolved = this.resolveCaptureId(token);
+      if ('error' in resolved) return [resolved.error];
+      id = resolved.id;
+    }
+    const rows = await this.api.listExecutions(this.room.endpoint.id, id);
+    const ref = id.slice(0, RECORD_REF_CHARS);
+    if (rows.length === 0) return [info(msg.noReceipts(ref))];
+    return [{
+      type: 'view',
+      title: msg.receiptsHeader(ref),
+      lines: rows.map((r) => sanitizeWireLine(msg.receiptRow(r.targetId, r.status, r.responseStatusCode, r.durationMs))),
+    }];
+  }
+
+  /**
+   * :verify: attribution over this session's feed (owner, seats, unsigned) and,
+   * when the posts carry a prevHash pointer, the hash chain over them in feed
+   * order, through the same verifyChain the catalog tool runs.
+   */
+  private verifyFeed(): ConsoleEvent[] {
+    if (!this.room) return [error(msg.unbound)];
+    if (this.feedPosts.size === 0) return [info(msg.verifyEmpty)];
+    let owner = 0;
+    let seats = 0;
+    let unsigned = 0;
+    const chained: Record<string, unknown>[] = [];
+    for (const facts of this.feedPosts.values()) {
+      if (facts.mine) owner++;
+      else if (facts.signerLabel) seats++;
+      else unsigned++;
+      if (facts.body && typeof facts.body.prevHash === 'string') chained.push(facts.body);
+    }
+    const lines = [msg.verifyAttribution(owner, seats, unsigned, this.feedPosts.size)];
+    if (chained.length === 0) {
+      lines.push(msg.verifyNoChain);
+    } else {
+      const result = verifyChain(chained);
+      lines.push(result.intact ? msg.verifyChainIntact(result.count) : msg.verifyChainBroken(result.brokenAt ?? 0));
+    }
+    return [{ type: 'view', title: 'Verify:', lines: lines.map((l) => `  ${l}`) }];
   }
 
   /**
@@ -1215,7 +1829,9 @@ export class ConsoleEngine {
       const tok = text.slice(0, space);
       const rest = text.slice(space).trim();
       const resolved = this.resolveCaptureId(tok);
-      if (!('error' in resolved) && this.proposals.has(resolved.id) && rest.length > 0) {
+      // #499 gap 9/10: any post the feed carried is a reply target, not only a
+      // proposal - the frontend arms a post header the same way it arms a decision.
+      if (!('error' in resolved) && this.feedIds.has(resolved.id) && rest.length > 0) {
         return this.performReply(resolved.id, rest);
       }
     }
@@ -1242,7 +1858,15 @@ export class ConsoleEngine {
     if (lowered === 'retract' || lowered === 'retracted') {
       return [info(msg.wordGavelRetract(word)), ...(await this.performRetract(proposalId, null))];
     }
-    const { events, ok } = await this.deliver({ kind: 'message', to: null, re: proposalId, text });
+    // #499 gap 10: the reply addresses the post's author (the seat handle, else
+    // the wire from claim), so a re-linked answer also wakes who asked.
+    const { events, ok } = await this.deliver({
+      kind: 'message',
+      to: this.authorAddress(proposalId),
+      for: this.forSection ?? this.proposals.get(proposalId)?.section ?? this.feedPosts.get(proposalId)?.section ?? null,
+      re: proposalId,
+      text,
+    });
     if (!ok) return events;
     const ref = proposalId.slice(0, RECORD_REF_CHARS);
     // A pending item keeps its no-disposition receipt; a reply against an
@@ -1344,6 +1968,11 @@ export class ConsoleEngine {
     this.pendingRatifyAll = null;
     this.pendingRecordPick = null;
     this.struck.clear();
+    this.feedPosts.clear();
+    this.lastPosted = null;
+    this.passes.clear();
+    this.pendingReseat = null;
+    this.roomMap = null;
   }
 
   /** Handles are assigned at bind over a stable sort, so a handle means one seat all session. */
@@ -1369,7 +1998,11 @@ export class ConsoleEngine {
     /** 'scratch' (#282) is the out-of-band channel: chair commentary, never direction. */
     kind: 'message' | 'whisper' | 'scratch';
     to: string | null;
+    /** #499 gap 2: the section the post is about; the :for modifier fills it when absent. */
+    for?: string | null;
     verb?: string;
+    /** #499 gap 5: the review verdict word, only ever beside fp:review. */
+    verdict?: string;
     args?: string[];
     re?: string;
     panic?: boolean;
@@ -1377,7 +2010,10 @@ export class ConsoleEngine {
   }): string {
     const body: Record<string, unknown> = { v: 1, kind: opts.kind, from: this.fromName() };
     if (opts.to) body.to = opts.to;
+    const section = opts.for ?? this.forSection;
+    if (section) body.for = section;
     if (opts.verb) body.verb = opts.verb;
+    if (opts.verb === 'fp:review' && opts.verdict) body.verdict = opts.verdict;
     if (opts.verb && opts.args && opts.args.length > 0) body.args = opts.args;
     if (opts.re) body.re = opts.re;
     if (opts.panic) body.panic = true;
@@ -1403,10 +2039,15 @@ export class ConsoleEngine {
     if (delivery.httpStatus === 429) return { events: [error(msg.postThrottled)], ok: false };
     if (!delivery.ok) return { events: [error(msg.postFailed(delivery.httpStatus, delivery.errorText))], ok: false };
     const events: ConsoleEvent[] = [info(msg.posted(signed, delivery.captureId))];
+    if (delivery.captureId) this.lastPosted = delivery.captureId;
+    const section = opts.for ?? this.forSection;
+    if (section) events.push(info(msg.postedFor(section)));
     // #284b: the receipt warns when to matches nobody's wire name. Warning only,
     // never a refusal - the post already landed on the shared stream.
     const missed = this.wireAddressMiss(opts.to);
     if (missed !== null) events.push(info(msg.toReachesNobody(missed)));
+    // #499 gap 6: a standing binding fired off this post; the receipt says so.
+    if (delivery.executions && delivery.executions.length > 0) events.push(info(msg.deliveredTo(delivery.executions.length)));
     return { events, ok: true };
   }
 
@@ -1419,8 +2060,11 @@ export class ConsoleEngine {
    * address and byline pass: seats answer there.
    */
   private wireAddressMiss(to: string | null | undefined): string | null {
-    if (!to || to === 'all') return null;
+    if (!to || to === 'all' || to === 'canon') return null;
     const target = to.toLowerCase();
+    // #499 gap 1: a handle the room map names is an address the room answers to
+    // (a hosted routine woken by a binding on to, the chair, the host).
+    if (this.roomMap?.roster.some((r) => r.handle.toLowerCase() === target)) return null;
     for (const seat of this.roster) {
       if (seat.guestName.toLowerCase() === target || handleBase(seat.guestName) === target) return null;
     }
@@ -1433,7 +2077,7 @@ export class ConsoleEngine {
     return (await this.deliver(opts)).events;
   }
 
-  private async mintSeat(guestName: string): Promise<ConsoleEvent[]> {
+  private async mintSeat(guestName: string, force = false): Promise<ConsoleEvent[]> {
     if (!this.room) return [error(msg.unbound)];
     // #284a: quote-strip and trim BEFORE anything else sees the name - a quoted
     // seat is unaddressable by the console grammar (the handle alphabet excludes
@@ -1446,7 +2090,42 @@ export class ConsoleEngine {
       this.pendingIdentity = { guestName };
       return [{ type: 'ask', text: msg.identityAsk(CHAIR_FROM) }];
     }
+    // #499 gap 16 (agreed by Gene 2026-09-23): a name that already holds a live
+    // seat is a re-seat, never a suffixed twin. y/N, or ! to skip the ask: the
+    // old seat is revoked, a fresh code minted under the same handle.
+    await this.refreshRoster(); // the server's truth, not the roster as of the last poll
+    const wire = handleBase(guestName);
+    const live = this.roster.find(
+      (s) => (s.status === 'accepted' || s.status === 'pending') && (handleBase(s.guestName) === wire || s.handle === wire),
+    );
+    if (live) {
+      if (force) return this.performReseat(guestName, live.inviteId, live.handle);
+      this.pendingReseat = { guestName, inviteId: live.inviteId, handle: live.handle };
+      return [{ type: 'confirm', text: msg.confirmReseat(live.handle) }];
+    }
     return this.performMint(guestName);
+  }
+
+  /** The re-seat (#499 gap 16): revoke, then mint under the same name; the new pass follows. */
+  private async performReseat(guestName: string, inviteId: string, handle: string): Promise<ConsoleEvent[]> {
+    if (!this.room) return [error(msg.unbound)];
+    await this.api.revokeInvite(this.room.endpoint.id, inviteId);
+    // #267: the revoked row leaves the assignment pool so the fresh mint keeps
+    // the handle instead of collision-suffixing beside its own corpse.
+    putSeatDeleted(this.room.endpoint.id, inviteId);
+    this.held.delete(handle);
+    this.idle.delete(handle);
+    this.departed.delete(handle);
+    await this.refreshRoster();
+    return [info(msg.reseated(handle)), ...(await this.performMint(guestName))];
+  }
+
+  /** :seat <handle> pass (#499 gap 16): the pass as minted this session, or where to get one. */
+  private reprintPass(handle: string): ConsoleEvent[] {
+    if (!this.room) return [error(msg.unbound)];
+    const pass = this.passes.get(handle) ?? this.passes.get(handleBase(handle));
+    if (!pass) return [error(msg.noPassFor(handle))];
+    return [info(msg.passReprinted(handle)), pass];
   }
 
   /**
@@ -1503,13 +2182,14 @@ export class ConsoleEngine {
     // The code renders IN THE FEED with the ferry warning, mirroring `flurryport seat`;
     // the pass itself is the paste-ready ferry payload (#244), carrying the
     // in-process room URL when this console hosts the room (#253).
-    events.push({
+    const pairing: Extract<ConsoleEvent, { type: 'pairing' }> = {
       type: 'pairing',
       code: mint.pairingCode,
       chairLines: [
         msg.seatMinted(mint.participantName, mint.ref, handle),
         ...(handle === wireName ? [] : [msg.seatHandleDiffers(handle, wireName)]),
         msg.ferryWarning(codeMinutes),
+        ...(mint.seatLink ? [msg.seatWebLink(mint.seatLink)] : []),
         msg.seatEnds(new Date(mint.expiresAt).toISOString()),
         msg.boardingPassHeader,
       ],
@@ -1521,7 +2201,9 @@ export class ConsoleEngine {
         seatServerUrl,
         room: this.room ? `${this.room.project.slug}/${this.room.endpointSlug}` : undefined,
       }),
-    });
+    };
+    this.passes.set(handle, pairing);
+    events.push(pairing);
     return events;
   }
 
@@ -1534,6 +2216,14 @@ export class ConsoleEngine {
     // The echo teaches the canonical spelling before the act's own receipts.
     if (cmd.verbFirst !== undefined) {
       if (!this.roster.some((s) => s.handle === cmd.target)) {
+        // #499 gap 5: bare `:hold <ref>` is the review verdict when the token is
+        // a post this feed carried, never a seat.
+        if (cmd.verb === 'hold' && !cmd.all) {
+          const resolved = this.resolveCaptureId(cmd.target);
+          if (!('error' in resolved) && this.feedIds.has(resolved.id)) {
+            return this.performReview('hold', resolved.id, cmd.text ?? null);
+          }
+        }
         return [error(msg.verbNeedsTarget(cmd.verb))];
       }
       const swapped: Extract<ParsedLine, { kind: 'targeted' }> = { ...cmd };
@@ -1546,7 +2236,26 @@ export class ConsoleEngine {
       : this.roster.some((s) => s.handle === cmd.target)
         ? [cmd.target]
         : null;
-    if (!targets) return [error(msg.unknownHandle(cmd.target))];
+    if (!targets) {
+      // #499 gap 1/12: a handle the room map names, or on an unsigned room the
+      // name as typed, is an address for a mention or a whisper. The other verbs
+      // (hold, status, revoke, ...) still need a minted seat.
+      if (cmd.verb === 'mention' || cmd.verb === 'whisper') {
+        const mapped = this.roomMap?.roster.some((r) => r.handle === cmd.target) === true;
+        const typed = !mapped && !this.room.signingEnabled;
+        if (mapped || typed) {
+          const { events, ok } = await this.deliver({
+            kind: cmd.verb === 'whisper' ? 'whisper' : 'message',
+            text: cmd.text ?? '',
+            to: cmd.target,
+          });
+          if (ok && typed) events.push(info(msg.typedAddress(cmd.target)));
+          return events;
+        }
+        return [error(this.roomMap ? msg.unknownAddress(cmd.target) : msg.unknownHandle(cmd.target))];
+      }
+      return [error(msg.unknownHandle(cmd.target))];
+    }
     if (cmd.all && targets.length === 0) return [info(msg.noSeats)];
 
     switch (cmd.verb) {
@@ -1881,14 +2590,22 @@ export class ConsoleEngine {
     let status: Record<string, unknown> | null = null;
     /** The one-line summary member (#281 G1 point 2 / G-bonus), sanitized. */
     let summary: string | null = null;
+    /** #499: the section (`for`), the from claim, the review verdict, and the parsed body. */
+    let section: string | null = null;
+    let from: string | null = null;
+    let verdict: string | null = null;
+    let parsedBody: Record<string, unknown> | null = null;
     const tags: string[] = [];
     try {
       const parsed = JSON.parse(row.body ?? '') as {
         v?: unknown;
         kind?: unknown;
+        from?: unknown;
         to?: unknown;
+        for?: unknown;
         text?: unknown;
         verb?: unknown;
+        verdict?: unknown;
         args?: unknown;
         re?: unknown;
         panic?: unknown;
@@ -1896,8 +2613,12 @@ export class ConsoleEngine {
         summary?: unknown;
       };
       if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        parsedBody = parsed as Record<string, unknown>;
         re = typeof parsed.re === 'string' && parsed.re.length > 0 ? parsed.re : null;
         panic = parsed.panic === true;
+        section = typeof parsed.for === 'string' && parsed.for.length > 0 ? parsed.for.toLowerCase() : null;
+        from = typeof parsed.from === 'string' && parsed.from.length > 0 ? parsed.from : null;
+        verdict = typeof parsed.verdict === 'string' && REVIEW_WORDS.has(parsed.verdict.toLowerCase()) ? parsed.verdict.toLowerCase() : null;
         if (typeof parsed.summary === 'string' && parsed.summary.length > 0) {
           summary = sanitizeWireLine(parsed.summary);
         }
@@ -1964,6 +2685,19 @@ export class ConsoleEngine {
     // both apply the same mutations keyed by the same post ids, so the chair's own
     // acts echoing back through the feed re-state facts already known, and a
     // backfill replays the whole record into the same view.
+    // #499: the facts every act reuses, kept per post (bounded by the feed).
+    this.feedPosts.set(row.id, {
+      from,
+      handle: seat?.handle ?? null,
+      mine,
+      section,
+      text: sanitizeWireLine(text).slice(0, RECORD_SUMMARY_CHARS),
+      summary,
+      body: parsedBody,
+      signerLabel: row.signerLabel,
+      re,
+    });
+
     if (verb?.raw === 'fp:propose') {
       if (!this.proposals.has(row.id)) {
         this.proposals.set(row.id, {
@@ -1973,6 +2707,9 @@ export class ConsoleEngine {
           at: row.createdAt,
           state: 'pending',
           settledAt: null,
+          section,
+          author: seat?.handle ?? from,
+          verdict: null,
         });
         this.ledgerVersion++;
       }
@@ -2014,6 +2751,14 @@ export class ConsoleEngine {
       // applying this same derivation sees the post struck.
       const target = this.resolveLogRef(re);
       if (target !== null) this.applyStrike(target);
+    } else if (re !== null && verb !== null) {
+      // #499 gap 5: a review verdict from ANY signer rides the ledger - fp:review
+      // with a verdict member, or the r:proceed family the rooms write.
+      const word = verb.raw === 'fp:review' ? verdict : verb.recipe && REVIEW_WORDS.has(verb.display.toLowerCase()) ? verb.display.toLowerCase() : null;
+      if (word !== null) {
+        const target = this.resolveLogRef(re);
+        if (target !== null) this.applyVerdict(target, word);
+      }
     }
     // A struck id re-delivered (backfill, cursor overlap) wears the mark (#282).
     if (this.struck.has(row.id)) tags.push(msg.struckMark);
@@ -2098,6 +2843,8 @@ export class ConsoleEngine {
           args: verb.args.map(sanitizeWireLine),
         },
         re: re === null ? null : sanitizeWireLine(re),
+        for: section === null ? null : sanitizeWireLine(section),
+        from: from === null ? null : sanitizeWireLine(from),
         panic,
         status,
         statusTicker,

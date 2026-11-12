@@ -13,6 +13,7 @@ import { postCommand } from './commands/post.js';
 import { echoCommand } from './commands/echo.js';
 import { mcpCommand } from './commands/mcp.js';
 import { seatServerCommand } from './commands/seat-server.js';
+import { accountServerCommand } from './commands/account-server.js';
 import { seatCommand } from './commands/seat.js';
 import { consoleCommand } from './commands/console.js';
 import { keysCommand } from './commands/keys.js';
@@ -41,6 +42,7 @@ program.addCommand(echoCommand);
 program.addCommand(keysCommand);
 program.addCommand(mcpCommand);
 program.addCommand(seatServerCommand);
+program.addCommand(accountServerCommand);
 program.addCommand(seatCommand);
 program.addCommand(consoleCommand);
 

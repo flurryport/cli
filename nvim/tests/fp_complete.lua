@@ -72,8 +72,12 @@ assert(c and vim.tbl_contains(c.matches, 'room') and vim.tbl_contains(c.matches,
 -- 8. a bound project scopes bare endpoints and :set endpoint
 fp.handle_event({ type = 'info', text = 'Bound to foo/room. 2 seats at the table. The feed is live.' })
 assert(complete.bound_project == 'foo', 'the bind receipt did not set the scope')
+-- #499 gap 15: the engine resolves :set endpoint across projects now, so the
+-- menu offers every room, the bound project's slug FIRST, then the pairs.
 c = complete.candidates(':set endpoint ')
-assert(c and #c.matches == 1 and c.matches[1] == 'room', 'bound :set endpoint should scope to the project')
+assert(c and c.matches[1] == 'room', "bound :set endpoint should offer the project's own slug first")
+assert(vim.tbl_contains(c.matches, 'other') and vim.tbl_contains(c.matches, 'bar/other'),
+  "bound :set endpoint should still offer the other projects' rooms")
 c = complete.candidates(':set r')
 assert(c and vim.tbl_contains(c.matches, 'room'), 'a bound project should offer its bare endpoints')
 

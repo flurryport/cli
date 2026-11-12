@@ -86,14 +86,19 @@ dtext = table.concat(vim.api.nvim_buf_get_lines(dbuf, 0, -1, false), '\n')
 assert(dtext:find('late addendum', 1, true), 'live re-linked post did not join the thread')
 assert(not dtext:find('more chatter'), 'a live unrelated post leaked in')
 
--- ── arming: one shot, verb lines exempt, answers exempt ──────────────────────
+-- ── arming: sticky (#499 gap 11), verb lines exempt, answers exempt ──────────
 assert(ui.armed and ui.armed.ref == 'prop0001', 'selection did not arm the decision')
 assert(ui.route_line(':list seats') == ':list seats', 'a verb line must pass through untouched')
 assert(ui.armed, 'a verb line must not consume the armed target')
 assert(ui.route_line('sounds right, so ruled') == ':re prop0001 sounds right, so ruled',
   'the next plain message must post re-linked to the armed decision')
-assert(ui.armed == nil, 'one shot: the armed target must clear after the send')
-assert(ui.route_line('a second message') == 'a second message', 'the shot already fired')
+-- #499 gap 11 (built on Gene's word 2026-09-23) reversed the #295 one shot:
+-- prose does not disarm, so a second line re-links too.
+assert(ui.armed and ui.armed.ref == 'prop0001', 'sticky: the armed target must HOLD after the send')
+assert(ui.route_line('a second message') == ':re prop0001 a second message', 'the second line re-links too')
+ui.disarm()
+assert(ui.route_line('a third message') == 'a third message', 'dropped, the prompt posts un-linked')
+ui.open_decision(decisions[1])
 
 -- An engine question owns the next line: the answer is never a reply.
 ui.open_decision(decisions[1])
@@ -216,11 +221,12 @@ ui.push({ type = 'feed', item = { at = '2026-08-17T18:08:00Z', id = 'retr0002AAA
 assert(ui.armed == nil, 'the fp:retract echo did not clear the selection')
 ui.show_feed()
 
--- The word gavel rides the existing armed one-shot: the exact word routes as
--- the explicit reply form, and the ENGINE reads the word as the act.
+-- The word gavel rides the arm: the exact word routes as the explicit reply
+-- form, and the ENGINE reads the word as the act. The arm holds (#499 gap 11)
+-- until the ratify echo returns the decision to live.
 ui.open_decision(decisions[1])
 assert(ui.route_line('Ratified') == ':re prop0001 Ratified',
   'the word routes as :re <ref> <text> for the engine to gavel')
-assert(ui.armed == nil, 'the one shot fired')
+assert(ui.armed and ui.armed.ref == 'prop0001', 'the arm holds until the disposition echoes')
 
 print('DECISIONS OK')

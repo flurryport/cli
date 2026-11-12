@@ -19,6 +19,14 @@ export const ATTENTION_VERBS = ['hold', 'resume', 'interrupt'] as const;
 /** Addressed order verbs (slice C): status (#246) and install/upgrade (#249). */
 export const ORDER_VERBS = ['status', 'install', 'upgrade'] as const;
 
+/**
+ * The review verdicts (#499 gap 5): a reviewer's word on a proposal, short of the
+ * gavel. `hold` is the fifth verdict but keeps its attention-verb head; the engine
+ * reads bare `:hold <ref>` as the review when the token is a feed reference.
+ */
+export const REVIEW_VERDICTS = ['proceed', 'finding', 'resolved', 'satisfied'] as const;
+export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number] | 'hold';
+
 // 'recolor' is parse-only (#278): the parser normalizes it to 'color' before anything
 // downstream sees it, so the alias is excluded here and exhaustive switches stay honest.
 export type TargetVerb =
@@ -59,6 +67,17 @@ export const RESERVED_WORDS: ReadonlySet<string> = new Set([
   're',
   'scratch',
   'strike',
+  // #499 (room-verb parity): the read heads, the section modifier, the canon pin,
+  // the review verdicts, and the arm's drop word. Reserved words grow with the grammar.
+  'for',
+  'none',
+  'sections',
+  'orient',
+  'canon',
+  'verify',
+  'receipts',
+  'pin',
+  ...REVIEW_VERDICTS,
   ...TARGET_VERBS,
   ...ATTENTION_VERBS,
   ...ORDER_VERBS,
@@ -75,10 +94,14 @@ export type ParsedLine =
   | { kind: 'help'; topic?: string }
   | { kind: 'colors' }
   | { kind: 'list'; what: 'projects' | 'endpoints' | 'seats' | 'decisions' }
-  | { kind: 'set'; what: 'project' | 'endpoint'; slug: string }
+  /** :set endpoint <text>[!] (#499 gap 15): force takes the first of several matches. */
+  | { kind: 'set'; what: 'project' | 'endpoint'; slug: string; force?: boolean }
   /** Both halves in one act: the "project/endpoint" form :list endpoints prints. */
   | { kind: 'bind'; project: string; endpoint: string }
-  | { kind: 'seat'; guestName: string }
+  /** :seat <name>[!] (#499 gap 16): force re-seats a live handle without the y/N. */
+  | { kind: 'seat'; guestName: string; force?: boolean }
+  /** :seat <handle> pass: reprint that seat's boarding pass without minting. */
+  | { kind: 'seat-pass'; handle: string }
   /** :exit / :quit / :q (synonyms, #253): bare verbs, no target, no args. */
   | { kind: 'exit' }
   /** :create endpoint <slug> / :create project <name> (#242): context-class WRITE verbs. */
@@ -120,6 +143,26 @@ export type ParsedLine =
   | { kind: 'scratch'; text: string; implied?: boolean }
   /** :strike <ref> (#282): unsay by reference; the strike propagates on the log. */
   | { kind: 'strike'; token: string; text?: string }
+  /**
+   * :for <section> <line> (#499 gap 2): a MODIFIER, not a post. The rest of the
+   * line is parsed again as a whole line (bare text, :re, :<handle>, :ratify)
+   * and posts carrying `for` = section. Composes with everything.
+   */
+  | { kind: 'for'; section: string; line: string }
+  /** :none: drop the arm. The frontend owns the arm; the engine only teaches. */
+  | { kind: 'none' }
+  /** :sections / :orient / :canon [section] (#499 gap 4): the read side of the room. */
+  | { kind: 'sections'; open?: { handle: string; description: string }; remove?: string }
+  | { kind: 'orient' }
+  | { kind: 'canon'; section?: string }
+  /** :verify (#499 gap 6): attribution and hash-chain state over this session's feed. */
+  | { kind: 'verify' }
+  /** :receipts [ref] (#499 gap 6): delivery executions for a post, default the last one posted. */
+  | { kind: 'receipts'; token?: string }
+  /** :pin <ref> <section> [recap] (#499 gap 3): file a post as the section's standing canon. */
+  | { kind: 'pin'; token: string; section: string; text?: string }
+  /** :proceed | :finding | :resolved | :satisfied [ref] [prose] (#499 gap 5): a review verdict. */
+  | { kind: 'review'; verdict: ReviewVerdict; token?: string; text?: string }
   /** A seat-addressed act. target is the raw handle token ('all' rides the all flag). */
   | {
       kind: 'targeted';
@@ -164,6 +207,10 @@ export type ParseErrorCode =
   | 're_needs_text'
   | 'scratch_needs_text'
   | 'strike_needs_ref'
+  | 'for_usage'
+  | 'sections_usage'
+  | 'pin_usage'
+  | 'canon_usage'
   | 'invalid_handle';
 
 /**
@@ -304,14 +351,23 @@ export function parseLine(line: string): ParsedLine {
         .flatMap((t) => t.split('/'))
         .filter((t) => t.length > 0);
       if (slugs.length === 2) return { kind: 'bind', project: slugs[0], endpoint: slugs[1] };
-      if (slugs.length === 1 && noun) return { kind: 'set', what: noun, slug: slugs[0] };
+      if (slugs.length === 1 && noun) {
+        // #499 gap 15: a trailing ! on the endpoint half takes the first match.
+        const { verb: slug, force } = noun === 'endpoint' ? splitForce(slugs[0]) : { verb: slugs[0], force: false };
+        return force ? { kind: 'set', what: noun, slug, force: true } : { kind: 'set', what: noun, slug };
+      }
       return { kind: 'error', code: 'set_usage' };
     }
     case 'seat': {
       if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'seat' };
-      const guestName = restAfter(body, tokens, 1);
-      if (!guestName) return { kind: 'error', code: 'seat_needs_name' };
-      return { kind: 'seat', guestName };
+      // #499 gap 16: `:seat <handle> pass` reprints; a trailing ! re-seats a live
+      // handle without the y/N. The name is the rest of the line, as before.
+      if (tokens.length === 3 && tokens[2].toLowerCase() === 'pass') return { kind: 'seat-pass', handle: tokens[1] };
+      const raw = restAfter(body, tokens, 1);
+      if (!raw) return { kind: 'error', code: 'seat_needs_name' };
+      const { verb: guestName, force } = splitForce(raw);
+      if (!guestName.trim()) return { kind: 'error', code: 'seat_needs_name' };
+      return force ? { kind: 'seat', guestName: guestName.trim(), force: true } : { kind: 'seat', guestName };
     }
     case 'say': {
       // #259: post the rest of the line LITERALLY. This is how a bare word the
@@ -398,6 +454,74 @@ export function parseLine(line: string): ParsedLine {
       const text = restAfter(body, tokens, 2);
       return text ? { kind: 'strike', token: tokens[1], text } : { kind: 'strike', token: tokens[1] };
     }
+    case 'for': {
+      // #499 gap 2: the section modifier. `:for <section> <line>` re-parses the
+      // rest as a whole line, so it composes with every post form.
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'for' };
+      if (tokens.length < 3) return { kind: 'error', code: 'for_usage' };
+      const section = tokens[1].toLowerCase();
+      const line = restAfter(body, tokens, 2);
+      if (!line || !HANDLE_RE.test(section)) return { kind: 'error', code: 'for_usage' };
+      return { kind: 'for', section, line };
+    }
+    case 'none':
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'none' };
+      return { kind: 'none' };
+    case 'sections': {
+      // The one verb reads AND writes the map (#499 gap 17). Bare is the view it
+      // always was; a handle plus prose opens or redescribes a topic; `rm` closes
+      // one. Opening demands the description in the same line on purpose: a
+      // section whose description is thin is what makes a seat answer vaguely.
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'sections' };
+      if (!tokens[1]) return { kind: 'sections' };
+      if (tokens[1].toLowerCase() === 'rm') {
+        const handle = tokens[2]?.toLowerCase();
+        if (!handle || !HANDLE_RE.test(handle)) return { kind: 'error', code: 'sections_usage' };
+        return { kind: 'sections', remove: handle };
+      }
+      const handle = tokens[1].toLowerCase();
+      const description = restAfter(body, tokens, 2);
+      if (!HANDLE_RE.test(handle) || !description) return { kind: 'error', code: 'sections_usage' };
+      return { kind: 'sections', open: { handle, description } };
+    }
+    case 'orient':
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'orient' };
+      return { kind: 'orient' };
+    case 'canon': {
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'canon' };
+      if (tokens.length === 1) return { kind: 'canon' };
+      if (tokens.length === 2 && HANDLE_RE.test(tokens[1].toLowerCase())) return { kind: 'canon', section: tokens[1].toLowerCase() };
+      return { kind: 'error', code: 'canon_usage' };
+    }
+    case 'verify':
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'verify' };
+      return { kind: 'verify' };
+    case 'receipts': {
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'receipts' };
+      return tokens[1] ? { kind: 'receipts', token: tokens[1] } : { kind: 'receipts' };
+    }
+    case 'pin': {
+      // #499 gap 3: :pin <ref> <section> [recap]. The ref is a feed reference; the
+      // section a handle; anything after rides as the recap text.
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: 'pin' };
+      const section = tokens[2]?.toLowerCase();
+      if (!tokens[1] || !section || !HANDLE_RE.test(section)) return { kind: 'error', code: 'pin_usage' };
+      const text = restAfter(body, tokens, 3);
+      return text ? { kind: 'pin', token: tokens[1], section, text } : { kind: 'pin', token: tokens[1], section };
+    }
+    case 'proceed':
+    case 'finding':
+    case 'resolved':
+    case 'satisfied': {
+      // #499 gap 5: a review verdict, the ratify family's shape - bare, ref, or
+      // ref plus prose. The engine resolves the token (a feed reference) and
+      // falls back to the single pending proposal.
+      if (tokens[1]?.toLowerCase() === 'help' && tokens.length === 2) return { kind: 'help', topic: head };
+      const verdict = head as ReviewVerdict;
+      if (tokens.length === 1) return { kind: 'review', verdict };
+      const text = restAfter(body, tokens, 2);
+      return text ? { kind: 'review', verdict, token: tokens[1], text } : { kind: 'review', verdict, token: tokens[1] };
+    }
     case 'exit':
     case 'quit':
     case 'q': {
@@ -438,6 +562,13 @@ export function parseLine(line: string): ParsedLine {
               ...swapped,
               verbFirst: `:${handleTok} ${swapped.verb}${swapped.force ? '!' : ''}${args ? ` ${args}` : ''}`,
             };
+          }
+          // #499 gap 5: `:hold <ref> <prose>` is the review verdict. The attention
+          // hold takes no words, so a hold with prose can only be the review; the
+          // engine resolves the token as a feed reference (a seat name there is
+          // refused with the record hint, never silently held).
+          if (verb === 'hold' && args) {
+            return { kind: 'review', verdict: 'hold', token: handleTok, text: args };
           }
         }
         return { kind: 'error', code: 'verb_needs_target', token: verb };

@@ -229,22 +229,22 @@ test('anon boot registers the FULL unified inventory (lesson 24: one stable tool
     // "Save collection". remove_from_collection and replace_collection_item joined them (#348,
     // 2026-08-22): a canon section holds one item, so re-ratifying is a swap, not an append.
     // Deleting a collection outright stays human-only.
-    'add_to_collection',
+    'add_to_collection', 'archive_run',
     'authorize_standing',
-    'bind_transformation', 'capture_count', 'create_collection', 'create_endpoint', 'create_invite', 'create_replay_target',
-    'create_transformation', 'forward_to_localhost',
+    'bind_transformation', 'capture_count', 'create_collection', 'create_endpoint', 'create_invite', 'create_locker_install', 'create_replay_target',
+    'create_transformation', 'find_locker_runs', 'forward_to_localhost',
     // get_canon / list_sections: the room-state reads (#359, #363, 2026-08-22) - what stands
     // in each section, and the section map plus roster. Same reads the seat server mounts.
     'get_canon',
     'get_capture',
-    'get_capture_digest', 'get_capture_executions', 'get_capture_url', 'get_collection', 'get_endpoint',
+    'get_capture_digest', 'get_capture_executions', 'get_capture_url', 'get_collection', 'get_endpoint', 'get_locker_run',
     'get_project', 'get_project_plan', 'get_recipe', 'get_replay_execution',
     'get_replay_target',
     // get_server_info: #106 identity half (0.3.2) - version/mode/reachability self-identity.
     'get_server_info',
     // get_transformations: install-fix observability (2026-07-30) - roster + binding counts
     // so agents preflight transformation/binding headroom and verify unbinds non-destructively.
-    'get_transformations', 'get_upgrade_options', 'join_invite', 'lint_recipe', 'list_captures', 'list_collections', 'list_endpoints',
+    'get_transformations', 'get_upgrade_options', 'join_invite', 'lint_recipe', 'list_captures', 'list_collections', 'list_endpoints', 'list_locker_installs',
     // list_members / revoke_invite / revoke_member: 0.3.0 host membership management
     // (ratified 2026-07-28) - the mid-session add/teardown lever for long-held streams.
     'list_members',
@@ -270,7 +270,7 @@ test('anon boot registers the FULL unified inventory (lesson 24: one stable tool
     // set_target_headers: header-credential recipes (slack-post gap, 2026-07-29) - refs only, values via the vault.
     'set_target_headers',
     'set_watch_enabled', 'start_echo_server', 'update_replay_target', 'update_transformation',
-    'verify_chain', 'wait_for_captures', 'write_pipe_manifest',
+    'verify_chain', 'verify_receipt', 'wait_for_captures', 'write_pipe_manifest',
   ];
   const tools = (await anonMcp.rpc('tools/list', {})).result.tools.map((t) => t.name).sort();
   assert.deepEqual(tools, expected, String(tools));
@@ -545,22 +545,22 @@ test('authed toolset registers the exact expected inventory with webhook-trigger
     // "Save collection". remove_from_collection and replace_collection_item joined them (#348,
     // 2026-08-22): a canon section holds one item, so re-ratifying is a swap, not an append.
     // Deleting a collection outright stays human-only.
-    'add_to_collection',
+    'add_to_collection', 'archive_run',
     'authorize_standing',
-    'bind_transformation', 'capture_count', 'create_collection', 'create_endpoint', 'create_invite', 'create_replay_target',
-    'create_transformation', 'forward_to_localhost',
+    'bind_transformation', 'capture_count', 'create_collection', 'create_endpoint', 'create_invite', 'create_locker_install', 'create_replay_target',
+    'create_transformation', 'find_locker_runs', 'forward_to_localhost',
     // get_canon / list_sections: the room-state reads (#359, #363, 2026-08-22) - what stands
     // in each section, and the section map plus roster. Same reads the seat server mounts.
     'get_canon',
     'get_capture',
-    'get_capture_digest', 'get_capture_executions', 'get_capture_url', 'get_collection', 'get_endpoint',
+    'get_capture_digest', 'get_capture_executions', 'get_capture_url', 'get_collection', 'get_endpoint', 'get_locker_run',
     'get_project', 'get_project_plan', 'get_recipe', 'get_replay_execution',
     'get_replay_target',
     // get_server_info: #106 identity half (0.3.2) - version/mode/reachability self-identity.
     'get_server_info',
     // get_transformations: install-fix observability (2026-07-30) - roster + binding counts
     // so agents preflight transformation/binding headroom and verify unbinds non-destructively.
-    'get_transformations', 'get_upgrade_options', 'join_invite', 'lint_recipe', 'list_captures', 'list_collections', 'list_endpoints',
+    'get_transformations', 'get_upgrade_options', 'join_invite', 'lint_recipe', 'list_captures', 'list_collections', 'list_endpoints', 'list_locker_installs',
     // list_members / revoke_invite / revoke_member: 0.3.0 host membership management
     // (ratified 2026-07-28) - the mid-session add/teardown lever for long-held streams.
     'list_members',
@@ -586,7 +586,7 @@ test('authed toolset registers the exact expected inventory with webhook-trigger
     // set_target_headers: header-credential recipes (slack-post gap, 2026-07-29) - refs only, values via the vault.
     'set_target_headers',
     'set_watch_enabled', 'start_echo_server', 'update_replay_target', 'update_transformation',
-    'verify_chain', 'wait_for_captures', 'write_pipe_manifest',
+    'verify_chain', 'verify_receipt', 'wait_for_captures', 'write_pipe_manifest',
   ];
   const tools = (await authMcp.rpc('tools/list', {})).result.tools;
   const names = tools.map((t) => t.name).sort();

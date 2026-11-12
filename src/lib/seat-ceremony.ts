@@ -87,6 +87,12 @@ export interface RedeemedRelease extends SeatRelease {
   standingPreAuthorized: boolean;
   standingLive: boolean;
   standingCustody: string | null;
+  /**
+   * #508 Bring your AI: set when this seat is the agent a person brought, naming that
+   * person. Such an agent posts one paragraph of at most three sentences, one point each
+   * (ruled 2026-10-01). Null on any other seat and against an older server.
+   */
+  agentOf: string | null;
 }
 
 interface RedeemSeatWire {
@@ -104,6 +110,7 @@ interface RedeemSeatWire {
   StandingPreAuthorized?: boolean;
   StandingLive?: boolean;
   StandingCustody?: string | null;
+  AgentOf?: string | null;
 }
 
 async function attemptRedeem(apiBase: string, code: string): Promise<RedeemedRelease> {
@@ -140,6 +147,7 @@ async function attemptRedeem(apiBase: string, code: string): Promise<RedeemedRel
     standingPreAuthorized: wire.StandingPreAuthorized === true,
     standingLive: wire.StandingLive === true,
     standingCustody: wire.StandingCustody ?? null,
+    agentOf: wire.AgentOf ?? null,
   };
 }
 

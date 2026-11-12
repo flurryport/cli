@@ -4,6 +4,7 @@ import { CatalogApiError, getRecipe, lintRecipe, listRecipes, rankRecipesByQuery
 import { sanitizeOutboundError } from './fetch-error.js';
 import { resolveWebBaseUrl } from './mcp-meta.js';
 import { verifyChain } from './hashchain.js';
+import { parseReceipt, verifyBody, verifyReceipts, type ReceiptJwk, type SignedReceipt } from './receipts.js';
 
 /**
  * Catalog agent surface (B3.3): search_recipes / get_recipe. Mode-independent, read-only,
@@ -302,6 +303,75 @@ export function registerCatalogTools(server: McpServer): RegisteredTool[] {
               'hash: extending with it keeps the whole chain verifiable (still disclosed as legacy on every verify). ' +
               'Start a fresh log to get strict verification.'
             : `Chain breaks at event ${result.brokenAt}: its prevHash does not match the canonical hash of the previous event. Do not extend it - re-read the log and reconcile (a fork is a visible dispute, not a merge).`,
+      });
+    },
+  ));
+
+  // ── Locker (slice 2, 2026-11-05): the public verifier as a tool. The same module the
+  // browser page and the export bundle run; pure computation, no account, so "checkable
+  // without us" is true inside an agent conversation too.
+  registered.push(server.registerTool(
+    'verify_receipt',
+    {
+      title: 'Verify receipt',
+      description:
+        'Verify a Locker receipt, or a run of them oldest first, against the install\'s public key and the ' +
+        'chain in ONE call, with no server and no account. Use on what get_locker_run, archive_run or an ' +
+        'export bundle returned; never hand-roll the hash or the signature check. Pass body (the run document, ' +
+        'or its disclosure document after a redaction) with a single receipt to also check bodySha256 or ' +
+        'leafRoot; a redacted field still verifies by its hash. Pass publicKey to pin a key instead of ' +
+        'trusting the one on the receipt. Returns intact, signaturesValid, brokenAt, count, nextPrevHash, ' +
+        'keyIds, body, and anchored (false until the timestamp anchor lands).',
+      inputSchema: {
+        receipts: z.array(z.record(z.string(), z.unknown())).min(1).max(5000)
+          .describe('Signed receipt documents (schema locker.receipt/1), oldest first.'),
+        publicKey: z.object({ kty: z.literal('EC'), crv: z.literal('P-256'), x: z.string(), y: z.string() }).optional()
+          .describe('Pin this JWK; default is the key on each receipt (its thumbprint must equal keyId either way).'),
+        genesisPrevHash: z.string().max(200).optional()
+          .describe('What the first receipt\'s prevHash must equal (default "", a chain from its genesis).'),
+        body: z.string().max(2_000_000).optional()
+          .describe('With one receipt: the run document or disclosure document to check against it.'),
+      },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ receipts, publicKey, genesisPrevHash, body }:
+      { receipts: Record<string, unknown>[]; publicKey?: ReceiptJwk; genesisPrevHash?: string; body?: string }) => {
+      const parsed: SignedReceipt[] = [];
+      for (let i = 0; i < receipts.length; i++) {
+        const r = parseReceipt(receipts[i]);
+        if (!r) return fail(400, `receipts[${i}] is not a locker.receipt/1 document.`, 'Pass the receipt object exactly as get_locker_run or archive_run returned it.');
+        parsed.push(r);
+      }
+      const result = await verifyReceipts(parsed, { publicKey, genesisPrevHash });
+      let bodyCheck: Awaited<ReturnType<typeof verifyBody>> | null = null;
+      if (body !== undefined) {
+        if (parsed.length !== 1) return fail(400, 'body applies to exactly one receipt.', 'Verify the run first, then the one receipt with its body.');
+        bodyCheck = await verifyBody(parsed[0], body);
+      }
+      const bodyOk = bodyCheck === null || bodyCheck.bodySha256Matches || bodyCheck.leafRootMatches === true;
+      return ok({
+        intact: result.intact,
+        signaturesValid: result.signaturesValid,
+        brokenAt: result.brokenAt,
+        badSignatures: result.badSignatures,
+        count: result.count,
+        nextPrevHash: result.nextPrevHash,
+        keyIds: result.keyIds,
+        body: bodyCheck,
+        anchored: false,
+        hint: !result.intact
+          ? `Chain breaks at receipt ${result.brokenAt}: its prevHash or hash does not match. Do not trust anything after it; tell your human which receipt broke.`
+          : !result.signaturesValid
+            ? `Chain links, but the signature fails on receipt(s) ${result.badSignatures.join(', ')}: the document or the key is not what the install signed.`
+            : !bodyOk
+              ? bodyCheck!.mode === 'disclosure'
+                ? 'Receipt valid, but the disclosure document does not reproduce leafRoot: a disclosed value was changed.'
+                : 'Receipt valid, but the body\'s SHA-256 is not the receipt\'s bodySha256: these are not the stored bytes (after a redaction, verify the disclosure document instead).'
+              : bodyCheck
+                ? bodyCheck.mode === 'disclosure'
+                  ? `Receipt and disclosure document verify; ${bodyCheck.redactedPaths.length} redacted leaf(s) hold by their hashes.`
+                  : 'Receipt and body verify: these are the bytes FlurryPORT recorded at that chain position.'
+                : `Receipt(s) verify: ${result.count} link(s), every signature valid under key(s) ${result.keyIds.join(', ')}.`,
       });
     },
   ));

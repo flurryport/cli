@@ -68,11 +68,20 @@ local function settled_epoch_ms(value)
   return (parsed + offset) * 1000
 end
 
---- The armed decision (#295, ruled): set by selecting a decision row, cleared
---- one shot by the next plain message, by selecting all or any seat, or by
---- going back to the live feed. { id, ref } or nil.
----@type { id: string, ref: string }|nil
+--- The arm (#295, reshaped by #499 gap 9 to 11): set by selecting a decision
+--- row (kind decision) or a post in the feed (kind post). It HOLDS across plain
+--- lines (#499 gap 11, built on Gene's word: prose does not disarm) and drops
+--- on selecting all or any seat, the none row, :none, going back to the live
+--- feed, or, for a decision arm only, the disposition echoing off the log.
+--- `to` is the post's author for the marker; the engine stamps it from the
+--- post itself. `unsigned` echoes the header's mark: the from is a typed claim.
+---@type { id: string, ref: string, kind: 'decision'|'post', to: string|nil, unsigned: boolean|nil }|nil
 M.armed = nil
+
+--- Feed buffer line -> the feed item painted there (#499 gap 9), so Enter or a
+--- click on a post's rows can arm it. Rebuilt on repaint; nil on console rows.
+---@type table<integer, table>
+M.feed_rows = {}
 
 --- An engine question (ask/confirm) owns the next prompt line (#262): that line
 --- is an ANSWER, so the armed decision must never consume it.
@@ -312,6 +321,16 @@ function M.open(on_submit)
   vim.wo[M.win.feed].breakindent = true
   vim.wo[M.win.feed].number = false
   vim.wo[M.win.feed].relativenumber = false
+  -- Enter or a double-click on a post arms it (#499 gap 9): the next lines
+  -- answer it and address its author. Only the live feed buffer carries the
+  -- line map; threads are built on demand and keep their own q.
+  vim.keymap.set('n', '<CR>', function() M.arm_under_cursor() end,
+    { buffer = M.buf.feed, nowait = true, desc = 'arm this post: the next lines answer it' })
+  vim.keymap.set('n', '<2-LeftMouse>', function() M.arm_under_cursor() end,
+    { buffer = M.buf.feed, nowait = true, desc = 'arm this post: the next lines answer it' })
+  -- A room remembered across :close wears its name again immediately (#499 gap 9);
+  -- a cold open paints nothing until the console's first `room` event.
+  M.apply_room()
 
   -- presence: a narrow pinned column on the right. `rightbelow` is not optional -
   -- a bare :vsplit honors the user's 'splitright', so the layout would mirror
@@ -410,6 +429,18 @@ function M.clear_pending()
   end
 end
 
+--- The 1-based buffer line the NEXT append lands on (#499 gap 9): the fresh
+--- scratch buffer's single empty line is replaced, not appended after.
+---@param buf integer
+---@return integer
+local function feed_start(buf)
+  local count = vim.api.nvim_buf_line_count(buf)
+  if count == 1 and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == '' then
+    return 1
+  end
+  return count + 1
+end
+
 ---@param event table
 function M.push(event)
   if not M.is_open() then
@@ -454,8 +485,9 @@ function M.push(event)
     -- the went-through signal: a refused act never reaches the log, so the
     -- selection holds. Checked after the thread writes above, so the ruling
     -- row joins the record before a decision thread returns to live.
+    -- A POST arm (#499 gap 11) ignores echoes: disposition means nothing to it.
     local verb = event.item.verb
-    if M.armed and type(verb) == 'table'
+    if M.armed and M.armed.kind ~= 'post' and type(verb) == 'table'
       and (verb.raw == 'fp:ratify' or verb.raw == 'fp:retract' or verb.raw == 'fp:strike')
       and M.in_decision(event.item, M.armed.id) then
       M.clear_decision()
@@ -465,11 +497,87 @@ function M.push(event)
   local lines = render.event(event)
   if #lines > 0 then
     local following = at_bottom(M.win.feed, M.buf.feed)
+    local first = feed_start(M.buf.feed)
     write(M.buf.feed, lines, true)
+    if event.type == 'feed' then
+      -- Every row the post occupies maps back to it (#499 gap 9), so Enter
+      -- anywhere on a wrapped body arms the same post as Enter on its header.
+      for row = first, vim.api.nvim_buf_line_count(M.buf.feed) do
+        M.feed_rows[row] = event.item
+      end
+    end
     if following then
       to_bottom(M.win.feed, M.buf.feed)
     end
   end
+end
+
+--- The arm's prompt marker (#499 gap 10): the ref, the author it addresses,
+--- and the unsigned mark when the header wore one.
+---@param armed table
+---@return string
+local function arm_marker(armed)
+  local text = '[re ' .. armed.ref
+  if armed.to then
+    text = text .. ' to ' .. armed.to
+  end
+  if armed.unsigned then
+    text = text .. ', unsigned'
+  end
+  return text .. ']'
+end
+
+--- Arm a post (#499 gap 9): the next lines answer it (re) and, through the
+--- engine, address its author (to). Replaces whatever was armed; one selection.
+---@param item table
+function M.arm_post(item)
+  if not item or not item.id then
+    return
+  end
+  local from = item.from
+  if from == vim.NIL or from == '' then
+    from = nil
+  end
+  M.armed = {
+    id = item.id,
+    ref = item.id:sub(1, 8),
+    kind = 'post',
+    to = (not item.mine) and from or nil,
+    unsigned = item.byline == 'unsigned',
+  }
+  M.set_pending(arm_marker(M.armed))
+end
+
+--- Enter or a click in the live feed (#499 gap 9): arm the post under the cursor.
+function M.arm_under_cursor()
+  if not (M.win.feed and vim.api.nvim_win_is_valid(M.win.feed)) then
+    return
+  end
+  if vim.api.nvim_win_get_buf(M.win.feed) ~= M.buf.feed then
+    return
+  end
+  local row = vim.api.nvim_win_get_cursor(M.win.feed)[1]
+  local item = M.feed_rows[row]
+  if item then
+    M.arm_post(item)
+  end
+end
+
+--- Does this token name a post this session saw (#499 gap 11)? Mirrors the
+--- engine's id-prefix floor, so a review verb's first word is read as a
+--- reference only when it really is one.
+---@param tok string|nil
+---@return boolean
+local function looks_like_ref(tok)
+  if not tok or #tok < render.ID_PREFIX_FLOOR then
+    return false
+  end
+  for _, item in ipairs(M.items) do
+    if item.id and item.id:sub(1, #tok) == tok then
+      return true
+    end
+  end
+  return false
 end
 
 --- The presence panel's width for these rendered lines (#260): fit the longest
@@ -558,6 +666,51 @@ local function schedule_settled_fade()
       paint_panel()
       schedule_settled_fade()
     end))
+  end
+end
+
+--- The winbar text for the bound room. `%` is winbar syntax, so a display name
+--- carrying one must be escaped or nvim renders half a status item.
+---@return string
+local function room_winbar()
+  if not M.room then
+    return ''
+  end
+  local pair = ('%s/%s'):format(M.room.project, M.room.endpoint)
+  local text = M.room.name and M.room.name ~= '' and ('%s  %s'):format(pair, M.room.name) or pair
+  return '%#FlurryPortCyan#' .. text:gsub('%%', '%%%%') .. '%*'
+end
+
+--- Where the console is (#499 gap 9), off the engine's `room` event. The feed is
+--- a scroll of bylines that never repeats the room, so the window wears it in two
+--- places: the winbar, which we control, and the buffer's NAME, because every
+--- statusline and tabline in the wild prints that and we cannot control those.
+---@param project string|nil
+---@param endpoint string|nil
+---@param name string|nil
+function M.set_room(project, endpoint, name)
+  M.room = (project and endpoint) and { project = project, endpoint = endpoint, name = name } or nil
+  M.apply_room()
+end
+
+--- Paint the current room onto the live feed window and buffer. Separate from
+--- set_room so reopening the room after :close wears the name again without the
+--- console having to re-announce it.
+function M.apply_room()
+  if M.buf.feed and vim.api.nvim_buf_is_valid(M.buf.feed) then
+    local target = M.room and ('flurryport://%s/%s'):format(M.room.project, M.room.endpoint) or 'flurryport://feed'
+    if vim.api.nvim_buf_get_name(M.buf.feed) ~= target then
+      -- A hidden buffer from an earlier room can still hold the name (E95), so
+      -- clear it out first; a rename that fails must not leave the pane nameless.
+      local clash = vim.fn.bufnr(target)
+      if clash ~= -1 and clash ~= M.buf.feed then
+        pcall(vim.api.nvim_buf_delete, clash, { force = true })
+      end
+      pcall(vim.api.nvim_buf_set_name, M.buf.feed, target)
+    end
+  end
+  if M.win.feed and vim.api.nvim_win_is_valid(M.win.feed) then
+    vim.wo[M.win.feed].winbar = room_winbar()
   end
 end
 
@@ -701,7 +854,7 @@ end
 --- line posts re-linked to it, one shot.
 ---@param dec table
 function M.open_decision(dec)
-  M.armed = { id = dec.id, ref = dec.ref }
+  M.armed = { id = dec.id, ref = dec.ref, kind = 'decision' }
   M.set_pending('[re ' .. dec.ref .. ']')
   local match = {
     { text = '  -- decision ' .. dec.ref .. ': ' .. render.decision_words(dec.summary)
@@ -735,42 +888,71 @@ function M.open_decision(dec)
   vim.api.nvim_win_set_buf(M.win.feed, buf)
 end
 
---- Route one submitted prompt line through the armed decision (#295): the next
---- PLAIN message is rewritten to the console's explicit reply form and the
---- target clears - one shot. A chair verb line (anything : led) passes through
---- untouched and KEEPS the armed target; a line answering an engine question
---- is an answer, never a message. Returns what the console should receive.
+--- Route one submitted prompt line through the arm (#295, #499 gap 11): every
+--- PLAIN message is rewritten to the console's explicit reply form and the arm
+--- HOLDS (sticky, built on Gene's word 2026-09-23: prose does not disarm, so
+--- the chair can write on both sides of a gavel). :none drops it and sends
+--- nothing. A chair verb line (anything : led) passes through and keeps the
+--- arm, except the selection-aware forms: bare :ratify and :retract, the
+--- review verdicts, and :for <section> <text>, which rewrite onto the armed
+--- ref. A line answering an engine question is an answer, never a message.
+--- Returns what the console should receive ('' sends nothing).
 ---@param line string
 ---@return string
 function M.route_line(line)
   if M.question_pending then
     M.question_pending = false
     if M.armed then
-      M.set_pending('[re ' .. M.armed.ref .. ']') -- the marker outlives the answered question
+      M.set_pending(arm_marker(M.armed)) -- the marker outlives the answered question
     end
     return line
   end
   if not M.armed or line == '' then
     return line
   end
+  local ref = M.armed.ref
   if line:sub(1, 1) == ':' then
-    -- Selection-aware record verbs (#295, ratified): with a decision armed, a
-    -- bare :ratify gavels THAT decision and a bare :retract nulls it - the line
-    -- rewrites to the explicit-ref form before the engine sees it, so the
-    -- engine's ratify-all y/N prompt appears only when nothing is armed. The
-    -- selection holds until the disposition echoes back off the log (push
-    -- drops it then); a refused act never echoes, so the selection survives.
-    local head = line:match('^:(%a+)%s*$')
-    if head == 'ratify' or head == 'retract' then
-      M.set_pending('[re ' .. M.armed.ref .. ']')
-      return ':' .. head .. ' ' .. M.armed.ref
+    local head, rest = line:match('^:(%S+)%s*(.*)$')
+    head = head and head:lower() or ''
+    if head == 'none' then
+      M.disarm()
+      return ''
+    end
+    -- Selection-aware record verbs (#295, ratified): with something armed, a
+    -- bare :ratify gavels IT and a bare :retract nulls it - the line rewrites
+    -- to the explicit-ref form before the engine sees it, so the engine's
+    -- ratify-all y/N prompt appears only when nothing is armed.
+    if (head == 'ratify' or head == 'retract') and rest == '' then
+      M.set_pending(arm_marker(M.armed))
+      return ':' .. head .. ' ' .. ref
+    end
+    -- The review verdicts (#499 gap 5): bare, or with prose that does not open
+    -- with a reference, act on the armed post.
+    if head == 'proceed' or head == 'hold' or head == 'finding' or head == 'resolved' or head == 'satisfied' then
+      local first = rest:match('^(%S+)')
+      if rest == '' then
+        M.set_pending(arm_marker(M.armed))
+        return ':' .. head .. ' ' .. ref
+      elseif not looks_like_ref(first) then
+        M.set_pending(arm_marker(M.armed))
+        return ':' .. head .. ' ' .. ref .. ' ' .. rest
+      end
+    end
+    -- :for <section> <text> with an arm (#499 gap 2): the text files for the
+    -- section AND answers the armed post. A : led tail is left as typed.
+    if head == 'for' then
+      local section, tail = rest:match('^(%S+)%s*(.*)$')
+      if section and tail ~= '' and tail:sub(1, 1) ~= ':' then
+        M.set_pending(arm_marker(M.armed))
+        return ':for ' .. section .. ' :re ' .. ref .. ' ' .. tail
+      end
     end
     -- clear_pending ran at submit; a verb line keeps the target, so re-pin.
-    M.set_pending('[re ' .. M.armed.ref .. ']')
+    M.set_pending(arm_marker(M.armed))
     return line
   end
-  local ref = M.armed.ref
-  M.armed = nil
+  -- Sticky (#499 gap 11): the arm holds; the marker is re-pinned for the next line.
+  M.set_pending(arm_marker(M.armed))
   return ':re ' .. ref .. ' ' .. line
 end
 
@@ -814,9 +996,16 @@ function M.repaint()
   local where = M.win.feed and vim.api.nvim_win_is_valid(M.win.feed)
     and vim.api.nvim_win_get_cursor(M.win.feed)[1] or 1
   local lines = {}
+  M.feed_rows = {}
   for _, event in ipairs(M.log) do
+    local first = #lines + 1
     for _, l in ipairs(render.event(event)) do
       table.insert(lines, l)
+    end
+    if event.type == 'feed' then
+      for row = first, #lines do
+        M.feed_rows[row] = event.item
+      end
     end
   end
   write(M.buf.feed, lines, false)
@@ -842,6 +1031,7 @@ function M.close()
   M.win = { feed = nil, presence = nil, prompt = nil }
   M.buf = { feed = nil, presence = nil, prompt = nil, envoys = {}, decisions = {} }
   M.items = {}
+  M.feed_rows = {}
   M.seat_rows = {}
   M.decision_rows = {}
   M.armed = nil

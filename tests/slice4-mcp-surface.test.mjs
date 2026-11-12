@@ -295,7 +295,11 @@ const BUDGET = {
   // UI). Both texts are at their lean form.
   // 0.6.11: +700 for the replay_to_target local-listener guard inputs and the
   // get_replay_execution listener note (#485). Deliberate, not drift.
-  ownerToolsListChars: 77_000,
+  // 0.6.13 (2026-11-05): the INVENTORY gained five verbs, Locker's (archive_run,
+  // get_locker_run, list_locker_installs, create_locker_install, verify_receipt): the
+  // signed run archive, slice 2 of the platform pass. Descriptions at their lean form.
+  // 0.6.14 (2026-11-06): +find_locker_runs (the find-a-value scan); fits under the line.
+  ownerToolsListChars: 86_000,
   // Raised 2026-08-26 for ruled contract text, after trimming: the rooms bash put
   // forSections (#411), checkOnly + the oversize warning (#405), the body
   // string-or-object union (#405), and the deduped roster (#409) on the seat
@@ -353,7 +357,10 @@ test('the pipes-and-rooms pitch leads, and claims only what is shipped (#350)', 
     // Category named and inverted in the same sentence.
     assert.match(text, /Not a tunnel, not a wiki, not a memory service/, name);
     // The five claimable strengths, and the webhook on-ramp still named.
-    assert.match(text, /rejected 401 before anything is stored/, name);
+    // Narrowed 2026-10-03: a refused post keeps a rejection row (headers, IP, reason);
+    // only the payload is never stored. The old wording must not return.
+    assert.match(text, /refused with a 401 and its payload never stored/, name);
+    assert.doesNotMatch(text, /before anything is stored/, name);
     assert.match(text, /signed by its own participant/, name);
     assert.match(text, /encrypted at rest/, name);
     assert.match(text, /secrets redacted from stored responses/, name);

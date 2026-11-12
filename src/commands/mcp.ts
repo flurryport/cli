@@ -140,6 +140,9 @@ async function buildMcpServer(
         allowLan: opts.allowLan,
         session: createAuthSessionState(),
         joinedGrants: () => scoped.map((c) => ({ projectId: c.projectId, endpointId: c.endpointId, accountName: c.accountName })),
+        clientName: () => server.server.getClientVersion()?.name ?? null,
+        surface: 'local',
+        version,
       };
       if (scoped.length > 0) {
         console.error(chalk.dim(
@@ -226,6 +229,9 @@ async function buildMcpServer(
       allowLan: opts.allowLan,
       session: createAuthSessionState(),
       joinedGrants: () => anonScoped.map((c) => ({ projectId: c.projectId, endpointId: c.endpointId, accountName: c.accountName })),
+      clientName: () => server.server.getClientVersion()?.name ?? null,
+      surface: 'local',
+      version,
     };
     wireWriteUpgrade(authCtx, anonInner);
 

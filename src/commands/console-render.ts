@@ -171,6 +171,14 @@ export function renderEvent(event: ConsoleEvent, width: number): string[] {
       return [];
     case 'help':
       return event.lines;
+    case 'view':
+      // A read view (#499): the title as the console talking, the rows dim.
+      return [chalk.bold(event.title), ...event.lines.map((l) => chalk.dim(l))];
+    case 'room':
+      // Where the console is (#499 gap 9). The terminal already said it in the
+      // `bound` line above this event, so printing it again would just be noise;
+      // the event exists for frontends with somewhere persistent to put it.
+      return [];
     case 'colors':
       // The palette is its own swatch card: each name rendered in its own color -
       // exactly what THIS terminal renders, extended names included when spoken.
@@ -204,7 +212,10 @@ export function renderEvent(event: ConsoleEvent, width: number): string[] {
                   : chalk.dim(stateWord);
         const held = s.held ? chalk.dim('  ' + msg.rosterHeldMark) : '';
         const hidden = s.hidden ? chalk.dim('  hidden') : '';
-        return `  ${paint(s.color, ':' + s.handle)}  ${sanitizeWireLine(s.guestName)}  ${liveness}${held}${hidden}`;
+        // #499 gap 4: the room map's role beside a minted seat; a map-only
+        // handle already wears the role as its state word.
+        const role = s.role && s.role !== s.status ? chalk.dim('  ' + s.role) : '';
+        return `  ${paint(s.color, ':' + s.handle)}  ${sanitizeWireLine(s.guestName)}  ${liveness}${held}${hidden}${role}`;
       });
     case 'decisions':
       // The decision ledger (#295): every flagged proposal, chronological, in
@@ -213,9 +224,10 @@ export function renderEvent(event: ConsoleEvent, width: number): string[] {
       // dim is done with (retracted and struck rows mute whole).
       return event.rows.map((d) => {
         const shown = d.summary.slice(0, RECORD_SUMMARY_CHARS);
+        // #499 gap 5: the latest review verdict rides beside a pending row.
         const state =
           d.state === 'needs-ratification'
-            ? chalk.yellow(d.state)
+            ? chalk.yellow(d.state) + (d.verdict ? ' ' + chalk.dim(msg.decisionVerdict(d.verdict)) : '')
             : d.state === 'ratified'
               ? chalk.green(d.state) + (d.ratifiedBy ? ' ' + chalk.dim(msg.decisionRatifiedBy(d.ratifiedBy)) : '')
               : chalk.dim(d.state);
@@ -294,6 +306,9 @@ export function renderEvent(event: ConsoleEvent, width: number): string[] {
       // Panic renders loudly; a re-link shows the answered post's short id in the meta.
       const panicMark = item.panic ? chalk.bgRed.white.bold(` ${msg.feedPanicMark} `) + ' ' : '';
       const reMark = item.re ? ' ' + chalk.dim(`[${msg.feedReMark(item.re)}]`) : '';
+      // #499 gap 13: the section the post is about, so the chair sees what an
+      // answer would file for.
+      const forMark = item.for ? ' ' + chalk.dim(`[for ${item.for}]`) : '';
       // A ticker riding a content post replaces the key: value stanza dump with
       // the same dim one-liner (collapsed when repeated); a status WITHOUT the
       // protocol `state` keeps the generic stanza rendering.
@@ -313,7 +328,7 @@ export function renderEvent(event: ConsoleEvent, width: number): string[] {
       } else if (panicMark) {
         meta += `  ${panicMark.trimEnd()}`;
       }
-      meta += `${reMark}${tags}`;
+      meta += `${reMark}${forMark}${tags}`;
       const body = item.text
         ? wrapText(item.text, Math.max(20, width - FEED_INDENT.length)).map((l) => FEED_INDENT + l)
         : [];

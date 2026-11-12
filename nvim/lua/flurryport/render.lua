@@ -174,6 +174,12 @@ local function meta_line(item)
   if item.re then
     put((' [re %s]'):format(item.re), 'FlurryPortDim')
   end
+  -- #499 gap 13: the section the post is about, so the chair sees what an
+  -- answer would file for. `for` is a Lua keyword, hence the index form.
+  local section = item['for']
+  if section and section ~= vim.NIL and section ~= '' then
+    put((' [for %s]'):format(section), 'FlurryPortDim')
+  end
 
   for _, tag in ipairs(item.tags or {}) do
     put((' [%s]'):format(tag), 'FlurryPortTag')
@@ -236,6 +242,12 @@ function M.event(event)
     for _, l in ipairs(event.lines or {}) do
       table.insert(out, line(l, 'FlurryPortDim'))
     end
+  elseif t == 'view' then
+    -- A read view (#499): the title as the console talking, the rows dim.
+    table.insert(out, line(event.title or '', 'FlurryPortInfo'))
+    for _, l in ipairs(event.lines or {}) do
+      table.insert(out, line(l, 'FlurryPortDim'))
+    end
   elseif t == 'ask' or t == 'confirm' then
     table.insert(out, line(event.text, 'FlurryPortAsk'))
   elseif t == 'pairing' then
@@ -292,6 +304,20 @@ M.ALL_ROSTER = 'all'
 --- The decisions section header (#295), under the seat rows in the same panel.
 M.DECISIONS_HEADER = '  decisions'
 
+--- The editor's own keys (#499 gap 14), appended to the full :help listing: the
+--- engine writes that listing and knows nothing about Enter, click, or the arm.
+M.EDITOR_KEYS = {
+  'Editor keys (nvim)',
+  '  Enter or double-click on a post  arm it: the next lines answer it (re) and address its author (to)',
+  '  Enter on a decision row  open its thread and arm it',
+  '  Enter on a seat  open that seat\'s thread; Enter on all  back to the live feed',
+  '  Enter on none, or :none  drop the arm',
+  '  with an arm: bare :ratify, :retract, :proceed, :hold, :finding, :resolved, :satisfied act on it; :for <section> <text> files the reply',
+  '  Tab  complete :set arguments, handles, and command heads; Up and Down  recall prompt lines',
+  '  q  close (in a thread: back to the live feed)',
+  '',
+}
+
 --- The clear row's label (#295, Gene's order from the code-2 room): the
 --- decisions twin of the seat rows' `all`. It reads `none` because the panel's
 --- lead rows name TARGETS, not actions - `all` addresses every seat, `none`
@@ -340,7 +366,15 @@ function M.decisions(rows)
           decision = row,
         })
       else
-        local marker = row.state == 'ratified' and '*' or '?'
+        -- #499 gap 5: a pending row wears its latest review verdict as the marker:
+        -- > proceed, resolved, satisfied (the way is clear); ! hold, finding (an
+        -- objection stands); ? unreviewed. Ratified stays *.
+        local verdict = row.verdict
+        if verdict == vim.NIL then verdict = nil end
+        local marker = row.state == 'ratified' and '*'
+          or ((verdict == 'proceed' or verdict == 'resolved' or verdict == 'satisfied') and '>')
+          or ((verdict == 'hold' or verdict == 'finding') and '!')
+          or '?'
         local group = row.state == 'ratified' and 'FlurryPortGreen' or 'FlurryPortYellow'
         table.insert(out, {
           text = '  ' .. marker .. ' ' .. words,

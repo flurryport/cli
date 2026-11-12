@@ -38,7 +38,7 @@ export interface McpHttpOptions {
    * reports its principal's seat expiry once redeemed, null before. The sweep
    * closes the session at that instant even if it is not idle.
    */
-  build: () => Promise<{
+  build: (bearer?: SessionBearer) => Promise<{
     server: McpServer;
     banner: string;
     expiresAt?: () => string | null;
@@ -105,7 +105,57 @@ export interface McpHttpOptions {
    * FLURRYPORT_MCP_ALLOWED_ORIGINS (comma-separated) adds more at run time.
    */
   allowedOrigins?: string[];
+  /**
+   * Track B (the account connector): present = every /mcp request must carry an OAuth
+   * bearer, and each session is BOUND to the account that opened it. Absent = the
+   * transport is unauthenticated, as the seat server needs (its ceremony is in-band).
+   */
+  auth?: McpHttpAuth;
+  /**
+   * Public GET-only files served ahead of the transport guard, by exact path: the
+   * connector's logo at /icon.png and /favicon.ico, which clients fetch cross-origin
+   * and unauthenticated while rendering the install card. Nothing here may be secret.
+   */
+  publicFiles?: Record<string, { contentType: string; body: Buffer }>;
 }
+
+/**
+ * The transport half of MCP authorization. This process holds NO signing secret and
+ * decides nothing: `verify` asks the API, which is the one authority on a token. What
+ * the transport reads from the bearer itself (sub, exp) is unverified and used only to
+ * route: a lying sub still meets the API's 401 on its first real call.
+ */
+export interface McpHttpAuth {
+  /** This resource's canonical URL, no trailing slash (the token's aud). */
+  resource: string;
+  /** The authorization server's issuer URL (RFC 8414 metadata lives under it). */
+  authorizationServer: string;
+  scopesSupported: string[];
+  /** Authoritative check at session open. False = 401 and no session. */
+  verify: (bearer: string) => Promise<boolean>;
+}
+
+/** A session's live credential. The client refreshes every 15 minutes; current() follows it. */
+export interface SessionBearer {
+  current: () => string;
+  /** The account (token sub) this session is bound to for its whole life. */
+  subject: string;
+}
+
+/** Unverified read of a JWT's sub/exp. Routing only; never an authorization decision. */
+export function peekBearer(bearer: string): { sub: string; exp: number | null } | null {
+  const parts = bearer.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, unknown>;
+    if (typeof claims.sub !== 'string' || claims.sub.length === 0) return null;
+    return { sub: claims.sub, exp: typeof claims.exp === 'number' ? claims.exp : null };
+  } catch {
+    return null;
+  }
+}
+
+export const PROTECTED_RESOURCE_METADATA_PATH = '/.well-known/oauth-protected-resource';
 
 export interface McpHttpHandle {
   /** The MCP endpoint URL with the ACTUAL bound port (port 0 asks the OS). */
@@ -134,6 +184,8 @@ interface SessionEntry {
   expiresAt?: () => string | null;
   /** The session's own idle window (#409): null = host default; Infinity = no idle reaping. */
   idleMs?: () => number | null;
+  /** Track B: the bound account + its latest bearer. Absent on unauthenticated transports. */
+  bearer?: { subject: string; value: string };
 }
 
 const DEFAULT_DRAIN_NOTICE = 'The server is shutting down; no new requests are accepted.';
@@ -227,6 +279,33 @@ function normalizeOrigin(raw: string): string {
   }
 }
 
+/**
+ * The MCP authorization 401: WWW-Authenticate points at the protected-resource metadata
+ * so the client can discover the authorization server. `error` is set only when a token
+ * WAS presented and failed (RFC 6750 3.1: a bare challenge carries no error code).
+ */
+/**
+ * RFC 9728 3.1: the well-known segment is INSERTED between the host and the resource's
+ * path, never appended. https://h/mcp -> https://h/.well-known/oauth-protected-resource/mcp.
+ */
+export function resourceMetadataUrl(resource: string): string {
+  const url = new URL(resource);
+  const path = url.pathname.replace(/\/$/, '');
+  return `${url.origin}${PROTECTED_RESOURCE_METADATA_PATH}${path}`;
+}
+
+function unauthorized(res: ServerResponse, auth: McpHttpAuth, error: 'invalid_token' | null): void {
+  const challenge =
+    `Bearer resource_metadata="${resourceMetadataUrl(auth.resource)}"` +
+    (error ? `, error="${error}"` : '');
+  res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': challenge });
+  res.end(JSON.stringify({
+    jsonrpc: '2.0',
+    error: { code: -32001, message: 'Authorization required: sign in to FlurryPORT to use this connector.' },
+    id: null,
+  }));
+}
+
 export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle> {
   const sessions = new Map<string, SessionEntry>();
   const log = opts.log ?? ((line: string) => console.error(chalk.dim(line)));
@@ -254,8 +333,9 @@ export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle>
   // FLURRYPORT_MCP_ALLOWED_ORIGINS (full-origin match, for browser-based tools
   // like the MCP Inspector that the operator deliberately points here).
   //
-  // Session-id -> principal binding is the Track B OAuth lane; until an account
-  // credential exists there is nothing second to bind a session to.
+  // Session-id -> principal binding exists only under opts.auth (Track B, the account
+  // connector): there the OAuth bearer's account is the second thing a session is bound
+  // to. A seat session has no credential outside its own in-band ceremony.
   const extraHosts = new Set(
     [
       ...(opts.allowedHosts ?? []),
@@ -317,6 +397,33 @@ export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle>
       res.end('ok');
       return;
     }
+    const publicFile = req.method === 'GET' ? opts.publicFiles?.[url.pathname] : undefined;
+    if (publicFile) {
+      res.writeHead(200, {
+        'Content-Type': publicFile.contentType,
+        'Content-Length': publicFile.body.length,
+        'Cache-Control': 'public, max-age=86400',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(publicFile.body);
+      return;
+    }
+    // RFC 9728 protected-resource metadata: public, static, and how a client that just
+    // met our 401 finds the authorization server. Served ahead of the transport guard
+    // (a browser-based client may fetch it cross-origin; there is nothing here to guard).
+    // The path-suffixed form is the one clients derive from an MCP URL ending in /mcp.
+    if (opts.auth && req.method === 'GET' &&
+        (url.pathname === PROTECTED_RESOURCE_METADATA_PATH ||
+         url.pathname === `${PROTECTED_RESOURCE_METADATA_PATH}/mcp`)) {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({
+        resource: opts.auth.resource,
+        authorization_servers: [opts.auth.authorizationServer],
+        scopes_supported: opts.auth.scopesSupported,
+        bearer_methods_supported: ['header'],
+      }));
+      return;
+    }
     // Precedent #3: everything past the health probe passes the transport guard.
     // /whoami skips only the HOST half: it is the #288 preflight an agent hits
     // BEFORE the operator has necessarily configured the tunnel host, it has no
@@ -343,6 +450,23 @@ export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle>
       return;
     }
 
+    // Track B: no bearer, an unreadable one, or one past its exp gets the MCP-spec 401
+    // whose WWW-Authenticate names the metadata above. The exp check matters mid-session:
+    // a tool call on a stale token would come back as a 200 carrying an API error, and
+    // the client would never learn it should refresh. The HTTP 401 is what tells it.
+    let presented: { sub: string; value: string } | null = null;
+    if (opts.auth) {
+      const header = firstHeader(req.headers.authorization);
+      const value = header?.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : '';
+      const peek = value ? peekBearer(value) : null;
+      const expired = peek?.exp != null && peek.exp * 1000 <= Date.now();
+      if (!peek || expired) {
+        unauthorized(res, opts.auth, value ? 'invalid_token' : null);
+        return;
+      }
+      presented = { sub: peek.sub, value };
+    }
+
     // #287: every /mcp response that turns into a held SSE stream (a long tool
     // call, the standalone GET channel) gets periodic keep-alive comments.
     armKeepAlive(res, keepAliveMs);
@@ -367,6 +491,21 @@ export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle>
         }));
         return;
       }
+      // Session-to-principal binding: a session answers only to the account that opened
+      // it. Another account holding the session id (leaked, guessed) gets the same 404 as
+      // a session that does not exist. The refreshed bearer replaces the old one.
+      if (entry.bearer && presented) {
+        if (entry.bearer.subject !== presented.sub) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            error: { code: -32001, message: 'Session not found; reinitialize.' },
+            id: null,
+          }));
+          return;
+        }
+        entry.bearer.value = presented.value;
+      }
       entry.lastActivity = Date.now();
       await entry.transport.handleRequest(req, res);
       return;
@@ -383,7 +522,20 @@ export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle>
       return;
     }
 
-    const { server, banner, expiresAt, idleMs: sessionIdleMs } = await opts.build();
+    // Opening a session is the one moment the API is asked directly: a forged or revoked
+    // token never gets a server built for it.
+    let bound: SessionEntry['bearer'];
+    if (opts.auth && presented) {
+      if (!(await opts.auth.verify(presented.value))) {
+        unauthorized(res, opts.auth, 'invalid_token');
+        return;
+      }
+      bound = { subject: presented.sub, value: presented.value };
+    }
+    const held = bound;
+    const { server, banner, expiresAt, idleMs: sessionIdleMs } = await opts.build(
+      held ? { current: () => held.value, subject: held.subject } : undefined,
+    );
     let entry: SessionEntry;
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
@@ -410,6 +562,7 @@ export async function serveMcpHttp(opts: McpHttpOptions): Promise<McpHttpHandle>
       lastActivity: Date.now(),
       expiresAt,
       idleMs: sessionIdleMs,
+      bearer: bound,
       close: async () => {
         if (closing) return;
         closing = true;

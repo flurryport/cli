@@ -22,6 +22,12 @@ export interface SeatMintRelease {
   codeExpiresAt: string;
   /** #409: true when the mint also pre-authorized the handle's standing-credential slot. */
   standingPreAuthorized: boolean;
+  /**
+   * Browser seats P3: the same code as a one-click web link ({APP_BASE_URL}/seat#code), for a
+   * PERSON taking the seat in a browser rather than an agent redeeming the pass. Null from a
+   * server that predates it.
+   */
+  seatLink: string | null;
 }
 
 export interface SeatMintOptions {
@@ -68,6 +74,7 @@ export async function mintSeatInvite(
     ExpiresAt: string;
     CodeExpiresAt: string;
     StandingPreAuthorized?: boolean;
+    SeatLink?: string | null;
   };
   return {
     pairingCode: res.PairingCode,
@@ -76,6 +83,7 @@ export async function mintSeatInvite(
     expiresAt: res.ExpiresAt,
     codeExpiresAt: res.CodeExpiresAt,
     standingPreAuthorized: res.StandingPreAuthorized ?? false,
+    seatLink: res.SeatLink ?? null,
   };
 }
 

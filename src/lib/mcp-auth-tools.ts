@@ -31,6 +31,7 @@ import { resolveRoomsUrl } from './rooms.js';
 import { getChairIdentity } from './console-view-state.js';
 import { codeMinutesLeft, mintSeatInvite } from './seat-mint.js';
 import { toolTitle } from './tool-title.js';
+import { registerLockerTools } from './mcp-locker-tools.js';
 
 /**
  * Authenticated-mode tools (spec §5 / §12.4-12.5): Tier-1 reads + forward_to_localhost
@@ -96,6 +97,14 @@ export interface AuthToolContext {
    * the room a monitor asks in is by definition one it was invited to.
    */
   joinedGrants?: () => Array<{ projectId?: string; endpointId?: string; accountName: string }>;
+
+  // ── Locker seams (slice 2, 2026-11-05) ───────────────────────────────────────
+  /** The MCP client's name from the initialize handshake; archive_run names the agent install after it. */
+  clientName?: () => string | null;
+  /** 'local' or 'hosted': the agent block on an archived run says which surface wrote it. */
+  surface?: string;
+  /** This server's version, for the client block on an archived run. */
+  version?: string;
 }
 
 /**
@@ -630,6 +639,17 @@ function hostAddress(roster?: Array<{ Handle?: string; Role?: string }> | null):
 }
 
 export function registerAuthTools(server: McpServer, ctx: AuthToolContext): void {
+  // Locker (slice 2): the four account tools, registered here so the unified local server,
+  // the hosted connector and the inventory locks all see one authed surface. The seat
+  // server mounts by name and never names them.
+  registerLockerTools(server, ctx, {
+    meta: () => authMeta(ctx, anyCachedPlan(ctx)),
+    mapError: (err) => mapAuthError(ctx, err, anyCachedPlan(ctx)),
+    clientName: () => ctx.clientName?.() ?? null,
+    surface: ctx.surface ?? 'local',
+    version: ctx.version ?? 'unknown',
+  });
+
   const id = z.string().describe('Opaque id from a prior list_* call, verbatim.');
 
   if (ctx.claimHandoff) announceClaim(ctx.session, ctx.claimHandoff);
@@ -1110,7 +1130,9 @@ scopeFailure(ctx, 'endpoint'),
       description:
         'One replay execution in detail, including the response body. Inputs: projectId, executionId. The ' +
         'body is full when the plan includes FullResponseBody, otherwise a 4KB preview, so check ' +
-        'ResponseBodyTruncated before parsing. A "No CLI connected" failure carries the listener steps.',
+        'ResponseBodyTruncated before parsing. DeliveredBodySha256 is the SHA-256 hex of the body as sent on ' +
+        'the last attempt, after transform and scrub: the receipt binds the bytes that left. A "No CLI ' +
+        'connected" failure carries the listener steps.',
       inputSchema: { projectId: id, executionId: id },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -2885,6 +2907,8 @@ scopeFailure(ctx, 'endpoint'),
             seatExpiresAt: mint.expiresAt,
             codeExpiresAt: mint.codeExpiresAt,
             codeExpiresInMinutes: codeMinutes,
+            // Browser seats P3: the same code as a one-click web link for a PERSON.
+            ...(mint.seatLink ? { seatLink: mint.seatLink } : {}),
             lifecycle: lifecycle ?? 'standing',
             ...(standing ? { standingPreAuthorized: mint.standingPreAuthorized } : {}),
             passText: consoleMessages
@@ -2910,7 +2934,12 @@ scopeFailure(ctx, 'endpoint'),
               'seatExpiresAt; posting and reading stop then, the log keeps its bylines. The joining agent ' +
               'redeems at the seat server address the pass names. Then HOLD THE ROOM: call ' +
               'wait_for_captures (or list_captures) so you see the guest arrive - its first post is ' +
-              'addressed to you, and nobody will prompt you to look.',
+              'addressed to you, and nobody will prompt you to look.' +
+              (mint.seatLink
+                ? ' If the seat is for a PERSON rather than an agent (no agent, no account), relay seatLink ' +
+                  'instead of passText: they open it in a browser and take the seat in one click. Same code, ' +
+                  'same single use, so send one or the other, never both.'
+                : ''),
           },
           authMeta(ctx, plan),
         );
@@ -3314,8 +3343,8 @@ scopeFailure(ctx, 'endpoint'),
         'Set up or rotate signed-intent posting for an endpoint. Inputs: an optional header the signature ' +
         'rides in, and projectId plus endpointId. A high-entropy signing key is generated LOCALLY, stored ' +
         'in the CLI keystore, and registered with the server in one atomic step, so the key value never ' +
-        'appears in this conversation. Afterwards post_intent signs automatically and the endpoint rejects ' +
-        'an unsigned post with 401 before storage. Re-running ROTATES the key, and anything still signing ' +
+        'appears in this conversation. Afterwards post_intent signs automatically and the endpoint refuses ' +
+        'an unsigned post with a 401 and never stores its payload. Re-running ROTATES the key, and anything still signing ' +
         'with the old one breaks at that moment. Read-write token.',
       inputSchema: {
         projectId: z.string().optional().describe('Opaque project id; omit to use the claimed or only project.'),

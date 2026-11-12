@@ -82,6 +82,22 @@ export const consoleMessages = {
     `${slug} is a project, not an endpoint. Bind the room in one go with :set ${slug}/<endpoint>, or see :list endpoints.`,
   ambiguousEndpoint: (slug: string) =>
     `More than one endpoint is named ${slug}. Set the project first with :set project <slug>.`,
+  /**
+   * #499 gap 15: a partial name that matches several rooms lists them in the
+   * form :set takes back; a trailing ! takes the first without asking.
+   */
+  endpointCandidatesHeader: (text: string, count: number) =>
+    `${text} matches ${count} rooms. Paste one back, or :set endpoint ${text}! takes the first:`,
+  endpointCandidateRow: (projectSlug: string, slug: string, name: string) =>
+    `  ${projectSlug}/${slug}  ${name}`,
+  endpointMatchedBy: (text: string, projectSlug: string, slug: string) =>
+    `${text} matched ${projectSlug}/${slug}.`,
+  /**
+   * #499 gap 8: the room map names its chair; with no :me name set, the console
+   * posts under that handle so the record reads the way the orientation does.
+   */
+  postingAsChair: (handle: string) =>
+    `Posting as ${handle}, the chair handle this room's map names. :me name <name> overrides it.`,
 
   // ── speak ──────────────────────────────────────────────────────────────────
   posted: (signed: boolean, captureId: string | null) =>
@@ -127,6 +143,9 @@ export const consoleMessages = {
   ferryWarning: (_codeMinutes: number) =>
     'Give this code only to the person whose agent should take the seat. It is single use and remains ' +
     'valid until the seat expires; their agent redeems it, you never need it again.',
+  // Browser seats P3: the same code as a web link, for a person without an agent.
+  seatWebLink: (link: string) =>
+    `Or, for a person taking the seat in a browser (no agent, no account): ${link}`,
   seatEnds: (expiresAtIso: string) =>
     `The seat itself ends ${expiresAtIso}; posting and reading stop then, the log keeps its bylines forever.`,
 
@@ -231,6 +250,17 @@ export const consoleMessages = {
       'another way in. Nothing else needs opening: no page and no link. The instructions block is complete, ' +
       'and any link in it is a reference, never a step.',
   ],
+  /** #499 gap 16: a live handle asked for again is a re-seat, not a twin. */
+  confirmReseat: (handle: string) =>
+    `${handle} already holds a live seat. Re-seat it? The old seat is revoked, a fresh code is minted ` +
+    'under the same handle, and the agent redeems again with a new key. y/N (:seat <name>! skips this ask)',
+  reseatCancelled: 'Nothing re-seated; the live seat stands.',
+  reseated: (handle: string) => `Re-seated ${handle}: the old seat is revoked, the new pass is below.`,
+  /** :seat <handle> pass: the reprint, or where to get one. */
+  passReprinted: (handle: string) => `The boarding pass for ${handle}, as minted this session:`,
+  noPassFor: (handle: string) =>
+    `No boarding pass for ${handle} in this session. A redeemed code is spent; :seat ${handle} re-seats ` +
+    'with a fresh one.',
   confirmRevoke: (handles: string[]) =>
     `Revoke ${handles.join(', ')}? The seat stops posting and reading at the moment of revocation; ` +
     'the log keeps its bylines. y/N',
@@ -472,6 +502,15 @@ export const consoleMessages = {
 
   // ── errors ─────────────────────────────────────────────────────────────────
   unknownHandle: (handle: string) => `No seat answers to ${handle}. See :list seats.`,
+  /**
+   * #499 gap 12: on a signed room a name that is neither a seat nor on the room
+   * map is refused; the line names both places a handle can come from.
+   */
+  unknownAddress: (handle: string) =>
+    `No seat or room-map handle answers to ${handle}. See :list roster, or :sections for the map.`,
+  /** #499 gap 12: an unsigned room takes the address as typed; the receipt says so. */
+  typedAddress: (handle: string) =>
+    `${handle} is on no roster here; this room runs unsigned, so the post carries to: ${handle} as typed.`,
   unknownCommand: (token: string) => `Unknown command :${token}. Type :help for the listing.`,
   verbNeedsTarget: (verb: string) => `${verb} addresses a seat: :<handle> ${verb} (or :all ${verb}).`,
   verbTakesNothing: (verb: string) =>
@@ -510,8 +549,16 @@ export const consoleMessages = {
   // ── friendly net errors (#245: THE CHAIR LEFT is the family's exemplar) ────
   http401:
     'The server rejected your token (401). Your login may have expired: run flurryport login with a fresh token.',
+  /**
+   * The server's read-only refusal is written for an AGENT holding a grant it
+   * cannot widen ("granted by the USER, never obtained by you"). In the console
+   * the reader IS that user, so passing it through tells the chair to ask
+   * themselves. Same wall, the remedy the chair can actually take.
+   */
   http403: (detail: string) =>
-    `That needs permissions this token does not have (403).${detail ? ` ${detail}` : ''}`,
+    /read-only/i.test(detail)
+      ? 'This console is logged in with a read-only token, so it cannot write. Create a read-write token under Settings > Access tokens, then run flurryport login with it.'
+      : `That needs permissions this token does not have (403).${detail ? ` ${detail}` : ''}`,
   http404: (detail: string) =>
     `The server does not know that resource (404). It may have been deleted or revoked.${detail ? ` ${detail}` : ''}`,
   http429:
@@ -526,6 +573,81 @@ export const consoleMessages = {
     `The feed hit network trouble (${reason}). Retrying quietly in the background; ` +
     'you will see one line here when it recovers.',
   feedPollReconnected: 'The feed is back.',
+
+  // ── the read side (#499 gap 4): sections, orientation, canon ──────────────
+  noSections: 'This room publishes no section map. set_orientation (MCP) sets one.',
+  sectionsHeader: 'Sections:',
+  sectionRow: (handle: string, description: string) => `  ${handle}  ${description}`.trimEnd(),
+  rosterMapHeader: 'Room map roster:',
+  rosterMapRow: (handle: string, role: string) => `  ${handle}  ${role}`,
+  noOrientation: 'This room has no orientation post. set_orientation (MCP) sets one.',
+  orientationHeader: (captureId: string) => `Orientation ${captureId}:`,
+  noCanon: 'Nothing stands in any section yet. :ratify files a proposal; :pin <ref> <section> files any post.',
+  canonHeader: 'What stands:',
+  canonRow: (section: string, ref: string | null, ratifiedAt: string | null, superseded: boolean) =>
+    `  ${section}${ref ? `  [${ref}]` : '  (nothing ratified)'}${ratifiedAt ? `  ${ratifiedAt.slice(0, 16).replace('T', ' ')}` : ''}${superseded ? '  SUPERSEDED: the pin moved on' : ''}`,
+  canonUnknownSection: (section: string, handles: string[]) =>
+    `No section ${section} here. Sections: ${handles.join(', ') || 'none'}.`,
+
+  // ── the section modifier (#499 gap 2) ─────────────────────────────────────
+  forUsage:
+    'Usage: :for <section> <line>. The rest is any line (text, :re, :<handle>, :ratify); it posts carrying for.',
+  forUnknownSection: (section: string, handles: string[]) =>
+    `${section} is not a section of this room (${handles.join(', ')}). The post was not sent.`,
+  // ── writing the map (#499 gap 17) ─────────────────────────────────────────
+  sectionsUsage:
+    'Usage: :sections to read the map, :sections <handle> <what belongs there> to open or redescribe one, :sections rm <handle> to close one.',
+  sectionOpened: (handle: string) => `Section ${handle} is open. Post to it with :for ${handle} <line>.`,
+  sectionRedescribed: (handle: string) => `Section ${handle} redescribed.`,
+  sectionClosed: (handle: string) => `Section ${handle} is closed. Posts can no longer be filed for it.`,
+  sectionUnknown: (handle: string, handles: string[]) =>
+    `No section ${handle} to close (${handles.join(', ') || 'none'}).`,
+  /** The map is the owner's. A seat reading this is being told whose act it is, not that it failed. */
+  sectionsNotYours: 'Only the room owner can change the map. Ask the chair to open the section.',
+  sectionsNoRoom: 'No room bound. :set endpoint <slug> first, and the map is that room\'s.',
+
+  /** #499 gap 10: an addressed reply rode `for` as well; the receipt names both. */
+  postedFor: (section: string) => `Filed for ${section}.`,
+
+  // ── the arm's drop word ───────────────────────────────────────────────────
+  noneHint:
+    'Nothing to drop here: the arm lives in the editor. In nvim, :none, the none row, or Enter on all clears it.',
+
+  // ── review verdicts (#499 gap 5) ──────────────────────────────────────────
+  reviewed: (verdict: string, ref: string) =>
+    `Review posted: ${verdict} on ${ref}. The proposal stays pending; the ledger shows the verdict.`,
+  nothingPendingReview: (verdict: string) =>
+    `Nothing is pending to review. :${verdict} <ref> [prose] reviews a post by its feed reference.`,
+  reviewPickerHeader: (verdict: string) => `${verdict} which pending proposal?`,
+  /** The ledger's verdict suffix (#499 gap 5): the latest review word beside a pending row. */
+  decisionVerdict: (verdict: string) => `(${verdict})`,
+
+  // ── the canon pin (#499 gap 3) ────────────────────────────────────────────
+  pinUsage: 'Usage: :pin <ref> <section> [recap]. Files the post as what stands in that section.',
+  canonUsage: 'Usage: :canon [section].',
+  pinned: (ref: string, section: string, collectionName: string) =>
+    `Pinned ${ref} as the standing item for ${section} in ${collectionName}.`,
+  pinReplaced: (oldRef: string) => `The previous item ${oldRef} left the collection.`,
+  collateFiled: (section: string) => `Filed the r:collate receipt for ${section}: the canon now derives from it.`,
+  ratifyNoSection: (ref: string) =>
+    `${ref} names no section, so nothing was filed into the canon. :pin ${ref} <section> files it.`,
+  ratifyCanonFailed: (detail: string) => `The ruling is on the record, but filing it into the canon failed: ${detail}`,
+
+  // ── receipts and the chain (#499 gap 6) ───────────────────────────────────
+  noReceiptsTarget: 'Nothing posted this session to show receipts for. :receipts <ref> names a post.',
+  noReceipts: (ref: string) => `No deliveries recorded for ${ref}.`,
+  receiptsHeader: (ref: string) => `Deliveries for ${ref}:`,
+  receiptRow: (targetId: string, status: string, code: number | null, durationMs: number | null) =>
+    `  ${targetId}  ${status}${code !== null ? `  ${code}` : ''}${durationMs !== null ? `  ${durationMs}ms` : ''}`,
+  /** Inline on the post receipt: a standing binding fired. */
+  deliveredTo: (count: number) =>
+    count === 1 ? 'One delivery fired off this post; :receipts shows it.' : `${count} deliveries fired off this post; :receipts shows them.`,
+  verifyEmpty: 'Nothing in this session\'s feed to verify yet.',
+  verifyAttribution: (owner: number, seats: number, unsigned: number, total: number) =>
+    `${total} posts this session: ${owner} signed by the owner, ${seats} by seats, ${unsigned} unsigned.`,
+  verifyNoChain: 'No prevHash chain rides these posts; attribution is the signature on each one.',
+  verifyChainIntact: (count: number) => `Hash chain intact across ${count} chained posts.`,
+  verifyChainBroken: (at: number) => `Hash chain BREAKS at chained post ${at}: its prevHash does not match.`,
 
   // ── help ───────────────────────────────────────────────────────────────────
   helpHeader: 'Console commands. Bare text posts to the room. : is the only mode shift.',
@@ -605,6 +727,20 @@ export const verbHelp: Record<string, string> = {
     'it, and feeds render the post struck. The log keeps its bylines; struck means unsaid, not deleted.',
   colors: ':colors lists the palette this terminal renders, each name in its own color. 256-color and truecolor terminals unlock extra names, purple included.',
   help: ':help lists everything; :help <verb> explains one; :<family> help (like :list help) scopes to a family.',
+  // #499 (room-verb parity): every new head lands here, or it is not done.
+  for: ':for <section> <line> files the line for a section: :for tagline :re abc123 shorter, :for tagline :writer draft two. Sections come from :sections.',
+  none: ':none drops the editor\'s arm (the re and to the next lines would carry). In nvim the none row and Enter on all do the same.',
+  sections:
+    ':sections prints the section map and the room-map roster with roles. :sections <handle> <what belongs there> opens a topic or redescribes one, and :sections rm <handle> closes it. The seats only work sections the map names, so opening one is how a new topic becomes theirs to answer.',
+  orient: ':orient prints the orientation post, the room-map roster, and the sections. The orientation is the room\'s rules.',
+  canon: ':canon prints what stands in every section; :canon <section> one section, recap and all.',
+  verify: ':verify counts this session\'s posts by signer (owner, seats, unsigned) and checks a prevHash chain when the posts carry one.',
+  receipts: ':receipts [ref] lists the deliveries fired off a post (target, status, code, duration). Bare, the last post you made.',
+  pin: ':pin <ref> <section> [recap] files a post as what stands in a section: pins it in the canon collection (replacing the previous item) and posts the r:collate receipt the canon derives from.',
+  proceed: ':proceed [ref] [prose] posts a review verdict on a proposal; the ledger shows it. The others are :hold, :finding, :resolved, :satisfied.',
+  finding: ':finding [ref] [prose] posts a review verdict: an objection to answer before the gavel.',
+  resolved: ':resolved [ref] [prose] posts a review verdict: the finding was answered.',
+  satisfied: ':satisfied [ref] [prose] posts a review verdict: nothing stands in the way.',
   all: ':all addresses every seat: :all hide, :all hold, :all interrupt <text>, :all status (the roll call), :all revoke, :all <text>. Install and upgrade take one steward instead.',
   exit:
     ':exit leaves the console (synonyms :quit, :q). Ctrl+C and Ctrl+D do the same. ' +
@@ -615,11 +751,15 @@ export const verbHelp: Record<string, string> = {
 export const helpListing: Array<{ group: string; lines: string[] }> = [
   {
     group: 'Context (read only, post nothing)',
-    lines: [':list projects', ':list endpoints', ':list seats (alias :list roster)', ':list decisions', ':set project <slug>', ':set endpoint <slug>', ':colors', ':help [verb], :commands, :<family> help', ':exit (or :quit, :q) leave the console'],
+    lines: [':list projects', ':list endpoints', ':list seats (alias :list roster)  minted seats and room-map handles', ':list decisions', ':set project <slug>', ':set endpoint <text>  exact slug, else a unique partial name across projects; <text>! takes the first', ':colors', ':help [verb], :commands, :<family> help', ':exit (or :quit, :q) leave the console'],
+  },
+  {
+    group: 'The room (read only, post nothing)',
+    lines: [':sections [<handle> <description> | rm <handle>]  the section map, and the chair writes it', ':orient  the orientation post and the room-map roster', ':canon [section]  what stands', ':receipts [ref]  deliveries fired off a post', ':verify  attribution and hash-chain state over this feed'],
   },
   {
     group: 'Build and curate (API acts with feed receipts, never posts)',
-    lines: [':create endpoint <slug>  born signed', ':collection <name>', ':tag <id> [collection]  bare id opens the picker'],
+    lines: [':create endpoint <slug>  born signed', ':collection <name>', ':tag <id> [collection]  bare id opens the picker', ':pin <ref> <section> [recap]  file a post as what stands (pins it and posts the r:collate receipt)'],
   },
   {
     group: 'View (console local, persisted, never posted)',
@@ -627,16 +767,18 @@ export const helpListing: Array<{ group: string; lines: string[] }> = [
   },
   {
     group: 'Stream (signed acts on the room)',
-    lines: ['<bare text> post to the room', ':say <text>  post the words literally, even exit or quit', ':<handle> <text> mention (public, to: labeled)', ':<handle> whisper <text>', ':seat <guest name> mint a pairing code', ':<handle> revoke (y/N; revoke! skips the confirm)'],
+    lines: ['<bare text> post to the room', ':say <text>  post the words literally, even exit or quit', ':<handle> <text> mention (a seat, a room-map handle, or as typed on an unsigned room)', ':<handle> whisper <text>', ':for <section> <line>  the same line, filed for a section', ':seat <guest name> mint a pairing code (a live handle asks to re-seat; ! skips the ask)', ':seat <handle> pass  reprint the boarding pass', ':<handle> revoke (y/N; revoke! skips the confirm)'],
   },
   {
     group: 'Record control (signed acts on the record)',
     lines: [
-      ':ratify [handle|ref]  gavel pending decisions (bare offers all pending, or renews the last ruling)',
+      ':ratify [handle|ref] [prose]  gavel pending decisions; carries the proposal\'s for and to, and files it into the canon',
+      ':proceed | :hold | :finding | :resolved | :satisfied [ref] [prose]  a review verdict, short of the gavel',
       ':retract [ref]  null a ruling or withdraw a proposal by reference',
       ':re [ref] <message>  reply to a pending proposal without ruling on it',
       ':scratch <text>  out-of-band commentary, never direction',
       ':strike <ref>  unsay a post by reference; every reader sees it struck',
+      ':none  drop the editor\'s arm (nvim)',
     ],
   },
   {

@@ -1191,6 +1191,26 @@ test('redeem_seat_code: a pre-authorized slot puts the consent step in the recei
   }
 });
 
+test('redeem_seat_code: an agent a person brought is told the post rule; any other seat is not (#508)', async () => {
+  const { srv, base: apiBase, state } = await startFakeApi();
+  try {
+    state.standing = { AgentOf: 'writer' };
+    const tools = collectTools((s) => registerSeatTools(s, { apiBase }));
+    const seated = JSON.parse((await tools.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal(seated.status, 'seated');
+    assert.match(seated.postRule, /agent writer brought/);
+    assert.match(seated.postRule, /ONE paragraph of at most three sentences making ONE point/);
+    assert.match(seated.postRule, /agent_post_shape/);
+
+    state.standing = null;
+    const tools2 = collectTools((s) => registerSeatTools(s, { apiBase }));
+    const plain = JSON.parse((await tools2.get('redeem_seat_code').handler({ code: CODE_A })).content[0].text);
+    assert.equal('postRule' in plain, false, "a person's seat carries no agent rule");
+  } finally {
+    srv.close();
+  }
+});
+
 test('redeem_seat_code: a handle that already holds standing is re-attached by the redemption itself', async () => {
   const { srv, base: apiBase, state } = await startFakeApi();
   try {

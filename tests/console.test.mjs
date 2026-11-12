@@ -1355,9 +1355,12 @@ test(':seat strips quotes at mint, and an all-quote name is refused, not minted'
 
 test('a collision mint tells the truth: the pass carries the WIRE name, the chair learns the split', async () => {
   putChairIdentity(CHAIR_FROM);
-  const { engine } = await boundEngine();
-  // Bunny already holds a seat; a second Bunny binds bunny-2 at the console, but
-  // the server assigned the name Bunny - the wire never carries the suffix.
+  const { engine, seats } = await boundEngine();
+  // Bunny's old seat is revoked but still on the roster (not deleted); a fresh
+  // Bunny binds bunny-2 at the console, but the server assigned the name Bunny -
+  // the wire never carries the suffix. (#499 gap 16: a LIVE Bunny would be a
+  // re-seat, not a twin - see the next test.)
+  seats[0].status = 'revoked';
   const events = await engine.execute(':seat Bunny');
   assert.equal(events[0].type, 'pairing');
   const pass = events[0].passLines.join('\n');
@@ -1366,6 +1369,48 @@ test('a collision mint tells the truth: the pass carries the WIRE name, the chai
   assert.match(pass, /console knows you as bunny-2/, 'the console-side suffix is named, not hidden');
   assert.match(pass, /read unfiltered/, 'the filter limitation is taught with the split');
   assert.match(events[0].chairLines.join('\n'), /wire name is bunny/, 'the chair learns the split at mint');
+});
+
+test(':seat on a LIVE handle re-seats it (#499 gap 16): y/N, revoke, fresh code under the same handle; ! skips the ask', async () => {
+  putChairIdentity(CHAIR_FROM);
+  const { engine, calls, seats } = await boundEngine();
+  // A re-seat marks the revoked invite deleted in the persisted view state (so
+  // the handle is kept); give this test its own invite id so the mark never
+  // leaks into a later test's Bunny.
+  seats[0].inviteId = 'inv-bunny-reseat';
+  const ask = await engine.execute(':seat Bunny');
+  assert.equal(ask[0].type, 'confirm', 'a live handle asks before re-seating');
+  assert.match(ask[0].text, /already holds a live seat/);
+  const kept = await engine.execute('n');
+  assert.match(kept[0].text, /live seat stands/);
+  assert.equal(calls.revokes.length, 0, 'n revokes nothing');
+  assert.equal(calls.mints.length, 0, 'n mints nothing');
+
+  await engine.execute(':seat Bunny');
+  const events = await engine.execute('y');
+  assert.deepEqual(calls.revokes, [{ endpointId: 'e1', inviteId: 'inv-bunny-reseat' }], 'y revokes the live seat first');
+  assert.equal(calls.mints.length, 1, 'then mints once');
+  assert.match(events[0].text, /Re-seated bunny/);
+  const pass = events.find((e) => e.type === 'pairing');
+  assert.ok(pass, 'the new pass follows');
+  assert.match(pass.passLines.join('\n'), /Your handle is bunny\./, 'the handle is kept: the revoked row left the pool');
+  assert.doesNotMatch(pass.passLines.join('\n'), /console knows you as/, 'no collision suffix on a re-seat');
+
+  // The force form skips the ask. The fresh Bunny's generated invite id gets a
+  // unique name too, for the same leak reason as above.
+  seats.find((x) => x.status === 'pending' && x.guestName === 'Bunny').inviteId = 'inv-bunny-reseat-2';
+  const forced = await engine.execute(':seat Bunny!');
+  assert.equal(forced[0].type, 'info');
+  assert.match(forced[0].text, /Re-seated bunny/);
+  assert.equal(calls.revokes.length, 2);
+
+  // :seat <handle> pass reprints the pass minted this session.
+  const reprint = await engine.execute(':seat bunny pass');
+  assert.match(reprint[0].text, /boarding pass for bunny/);
+  assert.equal(reprint[1].type, 'pairing');
+  const none = await engine.execute(':seat nobody pass');
+  assert.equal(none[0].type, 'error');
+  assert.match(none[0].text, /No boarding pass for nobody/);
 });
 
 test('an uncollided mint carries no split warning: one name, no extra lines', async () => {
@@ -1406,7 +1451,8 @@ test('the boarding pass teaches the /whoami preflight before the code is spent',
 
 test('the post receipt warns when to matches nobody wire name, and stays quiet when it does', async () => {
   putChairIdentity(CHAIR_FROM);
-  const { engine } = await boundEngine();
+  const { engine, seats } = await boundEngine();
+  seats[0].status = 'revoked'; // the old Bunny stays on the roster, so the fresh one collides
   await engine.execute(':seat Bunny'); // bunny-2 at the console, Bunny on the wire
   const missed = await engine.execute(':bunny-2 new orders');
   assert.match(missed[0].text, /Posted signed/);

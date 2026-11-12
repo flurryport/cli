@@ -64,6 +64,8 @@ export interface RoomMint {
   participantName: string;
   expiresAt: string;
   codeExpiresAt: string;
+  /** Browser seats P3: the code as a web link for a person, when the server gives one. */
+  seatLink?: string | null;
 }
 
 /** One collection row for the console's curation verbs (#251). */
@@ -71,6 +73,52 @@ export interface RoomCollection {
   id: string;
   name: string;
   itemCount: number;
+}
+
+/** One section of the room map (#363), as set_orientation stores it. */
+export interface RoomSection {
+  handle: string;
+  description: string;
+}
+
+/** One orientation-roster entry (#363): a handle the room map names, with its role. */
+export interface RoomRosterEntry {
+  handle: string;
+  role: string;
+}
+
+/** The room map (#363, #499): sections, the orientation roster, and the orientation lock. */
+export interface RoomMap {
+  sections: RoomSection[];
+  roster: RoomRosterEntry[];
+  orientationCaptureId: string | null;
+}
+
+/** One section's standing entry off the canon read (#359); every member nullable but the handle. */
+export interface RoomCanonRow {
+  sectionHandle: string;
+  description: string | null;
+  recapText: string | null;
+  decisionCaptureId: string | null;
+  collateCaptureId: string | null;
+  ratifiedAt: string | null;
+  collectionId: string | null;
+  superseded: boolean;
+}
+
+export interface RoomCanon {
+  orientationCaptureId: string | null;
+  sections: RoomCanonRow[];
+}
+
+/** One delivery receipt for a capture (#499 gap 6): the per-target latest execution. */
+export interface RoomExecution {
+  id: string;
+  targetId: string;
+  status: string;
+  responseStatusCode: number | null;
+  durationMs: number | null;
+  createdAt: string;
 }
 
 export interface RoomApi {
@@ -92,6 +140,23 @@ export interface RoomApi {
   /** Create a collection pinning the given feed captures (the server refuses an empty one). */
   createCollection(projectId: string, endpointId: string, name: string, captureIds: string[]): Promise<{ id: string; name: string }>;
   addToCollection(projectId: string, endpointId: string, collectionId: string, captureIds: string[]): Promise<{ addedCount: number }>;
+  /** Take captures out of a collection (#348): the other half of the canon swap. */
+  removeFromCollection(projectId: string, endpointId: string, collectionId: string, captureIds: string[]): Promise<{ removedCount: number }>;
+  /** The room map (#363): sections, orientation roster, orientation lock. Same read as list_sections. */
+  getRoomMap(projectId: string, endpointId: string): Promise<RoomMap>;
+  /**
+   * Write the room's SECTION MAP (#499 gap 17). The server takes the map WHOLE,
+   * so callers read-modify-write; `stateOnly` leaves the orientation lock exactly
+   * where it is, so opening a topic never moves the room's orientation capture.
+   * Owner only: a seat token answers 404, which the engine turns into a refusal.
+   */
+  setSections(projectId: string, endpointId: string, sections: RoomSection[]): Promise<void>;
+  /** What stands per section (#359). Same read as get_canon. */
+  getCanon(projectId: string, endpointId: string): Promise<RoomCanon>;
+  /** One capture's body as text (the orientation post, for :orient). Null when the server has no body. */
+  getCaptureBody(endpointId: string, captureId: string): Promise<string | null>;
+  /** Delivery receipts for one capture (#499 gap 6). Same read as get_capture_executions. */
+  listExecutions(endpointId: string, captureId: string): Promise<RoomExecution[]>;
   getEndpointDetail(projectId: string, endpointId: string): Promise<RoomEndpointDetail>;
   listSeats(endpointId: string): Promise<RoomSeat[]>;
   mintSeat(endpointId: string, guestName: string): Promise<RoomMint>;
@@ -232,6 +297,97 @@ export function createRoomApi(client: AuthApiClient): RoomApi {
         { CapturedRequestIds: captureIds.map((id) => toCaptureGuid(id)) },
       )) as { AddedCount?: number };
       return { addedCount: res.AddedCount ?? 0 };
+    },
+
+    async removeFromCollection(projectId, endpointId, collectionId, captureIds) {
+      const res = (await client.post(
+        `/api/v1/projects/${projectId}/endpoints/${endpointId}/collections/${collectionId}/remove-captures`,
+        { CapturedRequestIds: captureIds.map((id) => toCaptureGuid(id)) },
+      )) as { RemovedCount?: number };
+      return { removedCount: res.RemovedCount ?? 0 };
+    },
+
+    async getRoomMap(projectId, endpointId) {
+      const res = (await client.get(`/api/v1/projects/${projectId}/endpoints/${endpointId}/sections`)) as {
+        Sections?: Array<{ Handle: string; Description?: string | null }>;
+        Roster?: Array<{ Handle: string; Role: string }>;
+        OrientationCaptureId?: string | null;
+      };
+      return {
+        sections: (res.Sections ?? []).map((x) => ({ handle: x.Handle, description: x.Description ?? '' })),
+        roster: (res.Roster ?? []).map((x) => ({ handle: x.Handle, role: x.Role })),
+        orientationCaptureId: res.OrientationCaptureId ? guidToBase62(res.OrientationCaptureId) : null,
+      };
+    },
+
+    async setSections(projectId, endpointId, sections) {
+      await client.put(`/api/v1/projects/${projectId}/endpoints/${endpointId}/orientation`, {
+        CapturedRequestId: null,
+        Sections: sections.map((x) => ({ Handle: x.handle, Description: x.description })),
+        StateOnly: true,
+      });
+    },
+
+    async getCanon(projectId, endpointId) {
+      const res = (await client.get(`/api/v1/projects/${projectId}/endpoints/${endpointId}/canon`)) as {
+        OrientationCaptureId?: string | null;
+        Sections?: Array<{
+          SectionHandle: string;
+          Description?: string | null;
+          RecapText?: string | null;
+          DecisionCaptureId?: string | null;
+          CollateCaptureId?: string | null;
+          RatifiedAt?: string | null;
+          CollectionId?: string | null;
+          Superseded?: boolean;
+        }>;
+      };
+      const opaque = (id: string | null | undefined) => (id ? guidToBase62(id) : null);
+      return {
+        orientationCaptureId: opaque(res.OrientationCaptureId),
+        sections: (res.Sections ?? []).map((x) => ({
+          sectionHandle: x.SectionHandle,
+          description: x.Description ?? null,
+          recapText: x.RecapText ?? null,
+          decisionCaptureId: opaque(x.DecisionCaptureId),
+          collateCaptureId: opaque(x.CollateCaptureId),
+          ratifiedAt: x.RatifiedAt ?? null,
+          collectionId: opaque(x.CollectionId),
+          superseded: x.Superseded === true,
+        })),
+      };
+    },
+
+    async getCaptureBody(endpointId, captureId) {
+      const res = (await client.get(`/api/v1/endpoints/${endpointId}/captured-requests/${captureId}`)) as {
+        BodyBytes?: string | null;
+      };
+      if (!res.BodyBytes) return null;
+      return Buffer.from(res.BodyBytes, 'base64').toString('utf8');
+    },
+
+    async listExecutions(endpointId, captureId) {
+      const res = (await client.get(
+        `/api/v1/endpoints/${endpointId}/captured-requests/${captureId}/executions`,
+      )) as {
+        Items?: Array<{
+          Id: string;
+          ReplayTargetId: string;
+          ReplayStatus?: string | null;
+          ReplayStatusId?: number;
+          ResponseStatusCode?: number | null;
+          DurationMs?: number | null;
+          CreatedAt: string;
+        }>;
+      };
+      return (res.Items ?? []).map((x) => ({
+        id: guidToBase62(x.Id),
+        targetId: guidToBase62(x.ReplayTargetId),
+        status: x.ReplayStatus ?? String(x.ReplayStatusId ?? ''),
+        responseStatusCode: x.ResponseStatusCode ?? null,
+        durationMs: x.DurationMs ?? null,
+        createdAt: x.CreatedAt,
+      }));
     },
 
     async getEndpointDetail(projectId, endpointId) {

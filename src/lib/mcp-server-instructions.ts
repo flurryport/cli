@@ -38,7 +38,7 @@ const POSITIONING =
   'A pipe carries a piece of work out to a real service and hands back a signed record of what left. ' +
   'A room is one endpoint several agents and their people write to, so the record of a decision is the ' +
   'same record for everyone who was in it. What holds both up: signature validation on every plan, with ' +
-  'an unsigned post rejected 401 before anything is stored; every message signed by its own participant ' +
+  'an unsigned post refused with a 401 and its payload never stored; every message signed by its own participant ' +
   'key; encrypted at rest; secrets redacted from stored responses; PII masked on scoped credentials.';
 
 const PIPES_SURFACE =
@@ -122,7 +122,7 @@ const SHARED_TOOL_RULES = [
   '- Credentials never travel through this conversation. Never ask the user to paste a key, token, ' +
     'password, or secret value into the chat, and never read one back if they do. set_endpoint_signing ' +
     'generates the signing key locally and registers it in one step, post_intent then signs every post ' +
-    'automatically, and a signed endpoint rejects unsigned posts with 401 before storage. Secret VALUES ' +
+    'automatically, and a signed endpoint refuses unsigned posts with a 401 and never stores their payload. Secret VALUES ' +
     'reach the server only through request_secret_setup; you reference them by name as $secrets.NAME.',
   '- Never invent an error code, a limit, a plan name, or a capability. If a call refused, say what it ' +
     'refused with. If you do not know a number, read it with get_project_plan or get_upgrade_options.',
@@ -263,6 +263,48 @@ export const seatServerInstructions = (version: string): string => [
     'it is present. meta.standingOrder, when present, is the chair\'s line for every turn; obey it in ' +
     'every answer. Never invent an id, a code, or an error code; never ask your human ' +
     'to paste a key: your only credentials are the pairing code and a standing key.',
+].join('\n');
+
+/**
+ * The hosted ACCOUNT connector (Track B, mcp.flurryport.io). Same pitch and doctrine as
+ * the authed stdio server, minus everything that assumes a process on the user's machine:
+ * no loopback forwarding, no echo server, no CLI config or keystore to fall back on.
+ * Every tool the text names must be in the remote toolset (mcp-account.ts).
+ */
+const REMOTE_IDENTITY = (version: string): string =>
+  `FlurryPORT is connected as a hosted connector, flurryport@${version}, signed in to the user's account. ` +
+  'To answer what version you are on or whether the server is reachable, call get_server_info. It runs ' +
+  "in FlurryPORT's cloud, never on the user's machine, so it cannot reach localhost or a private " +
+  'network: to forward captures to a handler on their own machine the user installs the CLI ' +
+  '(npx flurryport). Server-side delivery to a registered target is replay_to_target.';
+
+const REMOTE_CAPTURE_ONRAMP = [
+  ...CAPTURE_ONRAMP.split('\n').slice(0, 4),
+  '3. To deliver a capture to a registered target, use replay_to_target, then read the outcome with ' +
+    'get_replay_execution.',
+].join('\n');
+
+const REMOTE_TOOL_RULES = SHARED_TOOL_RULES.split('\n')
+  .filter((line) => !line.startsWith('- If this MCP server process dies'))
+  .map((line) => line.startsWith('- Credentials never travel')
+    ? '- Credentials never travel through this conversation. Never ask the user to paste a key, token, ' +
+      'password, or secret value into the chat, and never read one back if they do. Secret VALUES reach ' +
+      'the server only through request_secret_setup; you reference them by name as $secrets.NAME. This ' +
+      'connector holds no signing key: a signed endpoint rejects its posts with 401, and signing is set ' +
+      'up from the CLI.'
+    : line)
+  .join('\n');
+
+export const accountServerInstructions = (version: string): string => [
+  REMOTE_IDENTITY(version),
+  POSITIONING,
+  PIPES_SURFACE,
+  ROOMS_SURFACE,
+  REMOTE_CAPTURE_ONRAMP,
+  EXPLAIN_NUDGE,
+  SECOND_STEP,
+  REMOTE_TOOL_RULES,
+  INSTALL_PREFLIGHT,
 ].join('\n');
 
 export const authServerInstructions = (version: string): string => [

@@ -109,6 +109,9 @@ export const seatCommand = new Command('seat')
       // Refinement 7's required warning: paste-conditioning is the inverted attack.
       console.log(chalk.yellow('Give this code only to the person whose agent should take the seat. It is single use'));
       console.log(chalk.yellow(`and dies in about ${codeMinutes} minutes; their agent redeems it, you never need it again.`));
+      if (release.seatLink) {
+        console.log(`For a person taking the seat in a browser instead (no agent, no account): ${chalk.bold(release.seatLink)}`);
+      }
       console.log(`The seat itself ends ${new Date(release.expiresAt).toISOString()}; posting and reading stop then, the log keeps its bylines forever.`);
       console.log('Their agent redeems it at the room address on the pass: the hosted room by default, a self-hosted ' +
         `${chalk.bold('flurryport seat-server')} only when you run your own.`);

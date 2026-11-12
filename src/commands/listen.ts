@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { Command, Option } from 'commander';
 import chalk from 'chalk';
 import * as readline from 'readline';
@@ -245,6 +245,8 @@ interface ForwardResult {
   responseBodyPreview: string | null;
   durationMs: number;
   error: string | null;
+  /** SHA-256 hex of the body handed to fetch, so the server's receipt binds the bytes that left. */
+  deliveredBodySha256: string;
 }
 
 /** Exported for the precedent-#5 harness: the printed line is wire-driven and must stay escape-free. */
@@ -253,6 +255,9 @@ export async function forwardCapture(capture: CapturedRequest, forwardUrl: strin
   if (capture.BodyBytes) {
     body = Buffer.from(capture.BodyBytes, 'base64');
   }
+  // Same digest the server computes for its own deliveries (DeliveredBodyDigest):
+  // SHA-256 over the exact bytes sent, an absent body as the empty string.
+  const deliveredBodySha256 = createHash('sha256').update(body ?? Buffer.alloc(0)).digest('hex');
 
   const headers = parseHeaders(capture.Headers);
   const url = capture.QueryString
@@ -292,6 +297,7 @@ export async function forwardCapture(capture: CapturedRequest, forwardUrl: strin
       responseBodyPreview: bodyText?.slice(0, 4096) ?? null,
       durationMs: duration,
       error: null,
+      deliveredBodySha256,
     };
   } catch (err) {
     const duration = Date.now() - start;
@@ -307,6 +313,7 @@ export async function forwardCapture(capture: CapturedRequest, forwardUrl: strin
       responseBodyPreview: null,
       durationMs: duration,
       error: message,
+      deliveredBodySha256,
     };
   }
 }
@@ -453,6 +460,7 @@ export const listenCommand = new Command('listen')
               ResponseBodyPreview: fwdResult.responseBodyPreview,
               DurationMs: fwdResult.durationMs,
               Error: fwdResult.error,
+              DeliveredBodySha256: fwdResult.deliveredBodySha256,
             });
           } catch (recordErr) {
             console.log(chalk.dim(`  (recording failed: ${(recordErr as Error).message})`));

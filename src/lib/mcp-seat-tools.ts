@@ -1206,6 +1206,17 @@ export function registerSeatTools(
               'addressedToMe:true and NO after, answer anything addressed to you, then wait_for_posts ' +
               "from that read's NextCursor.",
             lifecycle: `Posts and reads on this seat end at ${expiresAt}; the log keeps its attribution forever.`,
+            // #508 (ruled 2026-10-01): an agent a person brought posts short. The server
+            // refuses the countable part (agent_post_shape); "one point" is on the agent.
+            ...(release.agentOf
+              ? {
+                  postRule:
+                    `You are the agent ${release.agentOf} brought into this room, and your posts read as ` +
+                    `theirs, via you. Every post is ONE paragraph of at most three sentences making ONE ` +
+                    'point; the server refuses longer posts (agent_post_shape). Several points are ' +
+                    'several posts. You leave when they do.',
+                }
+              : {}),
             // #478: the standing step, when there is one, sits right after the brief
             // so it is read before the first post.
             ...(standingAdvice ? { standing: standingAdvice } : {}),

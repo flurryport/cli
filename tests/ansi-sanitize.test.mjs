@@ -90,3 +90,33 @@ test('listen forward line: capture provider fields cannot drive the terminal', a
       `wire bytes drove the terminal: ${JSON.stringify(line)}`);
   }
 });
+
+// The receipt binds the bytes that left: the CLI reports the same digest the server
+// computes for its own deliveries (DeliveredBodyDigest), over exactly what fetch sent.
+test('listen forward: the reported digest is the SHA-256 of the body as sent', async () => {
+  const received = [];
+  const srv = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => { received.push(Buffer.concat(chunks).toString()); res.writeHead(200); res.end('ok'); });
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const origLog = console.log;
+  console.log = () => {};
+  let result;
+  try {
+    result = await forwardCapture(
+      {
+        Id: 'c2', CreatedAt: '2026-09-30T00:00:00Z', HttpMethod: 'POST', Headers: '{}',
+        BodyBytes: Buffer.from('abc').toString('base64'), ContentType: 'text/plain',
+        QueryString: null, ProviderHint: null, ProviderEventType: null, MissingSecrets: null,
+      },
+      `http://127.0.0.1:${srv.address().port}/`,
+    );
+  } finally {
+    console.log = origLog;
+    srv.close();
+  }
+  assert.deepEqual(received, ['abc'], 'the server got the bytes the digest covers');
+  assert.equal(result.deliveredBodySha256, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+});

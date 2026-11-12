@@ -135,8 +135,28 @@ function M.handle_event(event)
     bound = true
     vim.schedule(refresh_presence)
   end
+  -- Where we ARE (#499 gap 9). The feed is a scroll of bylines and never repeats
+  -- the room, so the console names it and the window wears it. Panel state like
+  -- the roster: it paints the winbar and the buffer name, never the feed.
+  if event.type == 'room' then
+    ui.set_room(event.projectSlug, event.endpointSlug, event.name)
+    return
+  end
   if consumed or event.type == 'exit' then
     return
+  end
+  -- The full :help listing (#499 gap 14): the engine knows nothing about the
+  -- editor's keys, so they are appended here, on the listing only (a single
+  -- :help <verb> answer stays what the engine said).
+  if event.type == 'help' and event.lines and event.lines[1] and event.lines[1]:find('^Console commands') then
+    local lines = {}
+    for _, l in ipairs(event.lines) do
+      table.insert(lines, l)
+    end
+    for _, l in ipairs(render.EDITOR_KEYS) do
+      table.insert(lines, l)
+    end
+    event = { type = 'help', lines = lines }
   end
   ui.push(event)
 end
@@ -314,7 +334,11 @@ function M.setup(opts)
   -- Refuse to clobber somebody else's command. The check is best-effort by
   -- nature: if they load AFTER us they will overwrite us just as silently, and
   -- nvim gives no hook for that. Loud in the case we can see beats loud in none.
-  local taken = vim.api.nvim_get_commands({})[name] ~= nil
+  -- Our OWN command is not a clash: plugin/flurryport.lua registers it on load and a
+  -- plugin manager's setup(opts) runs after, so re-setup re-registers under the new
+  -- config instead of warning about itself (a renamed command drops the old name).
+  local existing = vim.api.nvim_get_commands({})[name] ~= nil
+  local taken = existing and M._command ~= name
   if taken then
     -- Never clobber. create_user_command overwrites silently, so the only way a
     -- clash is survivable is to notice it and say so.
@@ -323,6 +347,8 @@ function M.setup(opts)
       vim.log.levels.WARN
     )
   else
+    if M._command and M._command ~= name then pcall(vim.api.nvim_del_user_command, M._command) end
+    M._command = name
     vim.api.nvim_create_user_command(name, function(a)
     local sub_name, rest = a.args:match('^(%S+)%s*(.*)$')
     -- A bare call opens the room, because that is what you want nine times in ten.

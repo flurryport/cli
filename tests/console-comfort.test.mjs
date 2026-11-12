@@ -609,7 +609,9 @@ test('API failures reachable from a typed line map to the friendly status lines'
   for (const [status, exact, pattern] of cases) {
     const { engine, api } = await boundEngine();
     api.listCollections = async () => {
-      throw new AuthApiError(status, 'x', status === 403 ? 'Read-only token.' : '');
+      // NOT a read-only detail: that wall has its own chair-voiced line (#499 gap
+      // 17), asserted separately below. This case covers the generic 403.
+      throw new AuthApiError(status, 'x', status === 403 ? 'Endpoint is suspended.' : '');
     };
     const events = await engine.execute(':collection canon');
     assert.equal(events[0].type, 'error', `status ${status} is an error event`);
@@ -903,4 +905,17 @@ test('a suffixed handle (author-2) wears its own seat color as an addressee', as
   const feed = (await engine.pollFeed(1)).filter((e) => e.type === 'feed');
   // The wire never carries the console's collision suffix; the roster does.
   assert.equal(feed[0].item.toColor, 'yellow');
+});
+
+test('a read-only 403 is re-voiced for the chair, whatever verb hit it', async () => {
+  const { engine, api } = await boundEngine();
+  api.listCollections = async () => {
+    throw new AuthApiError(403, 'x',
+      'This token is read-only. Write access is granted by the USER, never obtained by you. Ask them, then simply retry.');
+  };
+  const events = await engine.execute(':collection canon');
+  assert.equal(events[0].type, 'error');
+  assert.match(events[0].text, /read-only token/);
+  assert.match(events[0].text, /flurryport login/);
+  assert.ok(!/Ask them/.test(events[0].text), 'the chair is not told to ask themselves');
 });

@@ -26,6 +26,15 @@ M.bound_project = nil
 --- Quiet-fetch bookkeeping: how many projects/endpoints answers to consume.
 local quiet = { projects = 0, endpoints = 0 }
 
+--- The console's command heads (#499 gap 14), for <Tab> after a bare colon.
+--- Kept in step with the engine's :help listing by hand; the handles win the
+--- top of the menu because a mention is the commoner line.
+M.COMMAND_HEADS = {
+  'all', 'canon', 'collection', 'colors', 'create', 'exit', 'finding', 'for', 'help', 'list', 'me',
+  'none', 'orient', 'pin', 'proceed', 'ratify', 're', 'receipts', 'resolved', 'retract', 'satisfied',
+  'say', 'scratch', 'seat', 'sections', 'set', 'strike', 'tag', 'verify',
+}
+
 function M.reset()
   M.projects, M.endpoints, M.handles, M.bound_project = {}, {}, {}, nil
   quiet = { projects = 0, endpoints = 0 }
@@ -182,7 +191,19 @@ function M.candidates(typed)
   end
   word = typed:match('^:set%s+endpoint%s+(%S*)$')
   if word then
-    return { start = #typed - #word, matches = prefixed(endpoint_slugs(M.bound_project), word) }
+    -- #499 gap 15: the engine resolves across projects now; offer every slug,
+    -- the bound project's first, then the project/slug pairs.
+    local pool = {}
+    for _, slug in ipairs(endpoint_slugs(M.bound_project)) do
+      add_unique(pool, slug)
+    end
+    for _, slug in ipairs(endpoint_slugs(nil)) do
+      add_unique(pool, slug)
+    end
+    for _, pair in ipairs(pair_forms(nil)) do
+      add_unique(pool, pair)
+    end
+    return { start = #typed - #word, matches = prefixed(pool, word) }
   end
   -- :set <arg>: project slugs, project/endpoint pairs, and bare endpoint slugs
   -- when a project is already set (those bind directly).
@@ -208,10 +229,18 @@ function M.candidates(typed)
     return { start = #typed - #word, matches = prefixed(pool, word) }
   end
   -- Seat handles: the mention target of a ':<handle>' line, and the word under
-  -- the cursor anywhere in a bare post line.
+  -- the cursor anywhere in a bare post line. The command heads complete there
+  -- too (#499 gap 14), after the handles.
   word = typed:match('^:(%S*)$')
   if word then
-    return { start = #typed - #word, matches = prefixed(M.handles, word) }
+    local pool = {}
+    for _, h in ipairs(M.handles) do
+      add_unique(pool, h)
+    end
+    for _, h in ipairs(M.COMMAND_HEADS) do
+      add_unique(pool, h)
+    end
+    return { start = #typed - #word, matches = prefixed(pool, word) }
   end
   if not typed:match('^%s*:') then
     word = typed:match('(%S+)$')
